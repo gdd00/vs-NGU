@@ -77,3 +77,13 @@ jobs:
           tag_name: ${{ inputs.release_tag }}
           files: dist/*.whl
           generate_release_notes: true
+
+  # Releases created with GITHUB_TOKEN do not trigger the release event, so refresh the index here.
+  update_index:
+    name: Update package index
+    needs: [publish_release]
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/index-pages.yml
