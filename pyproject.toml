@@ -1,0 +1,46 @@
+[build-system]
+requires = ["scikit-build-core>=0.10.0", "vapoursynth>=82"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "vapoursynth-ngu"
+version = "0.1.0"
+description = "VapourSynth NGU (Neural Graphics Upscaling) plugin"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "gdd00" }]
+dependencies = [
+    "vapoursynth>=82",
+]
+
+[project.urls]
+Homepage = "https://github.com/gdd00/vs-NGU"
+Repository = "https://github.com/gdd00/vs-NGU"
+
+[tool.scikit-build]
+wheel.exclude = ["*.lib", "*.exp"]
+wheel.install-dir = "vapoursynth/plugins"
+wheel.py-api = "py3"
+cmake.build-type = "Release"
+cmake.define.NGU_NATIVE_ARCH = "OFF"
+cmake.define.BUILD_TESTING = "OFF"
+
+[[tool.scikit-build.overrides]]
+if.platform-system = "win32"
+cmake.define.CMAKE_MSVC_RUNTIME_LIBRARY = "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL"
+
+[tool.cibuildwheel]
+build = "cp312-*"
+skip = "*-win32 *-manylinux_i686 *musllinux*"
+
+[tool.cibuildwheel.environment]
+NGU_NATIVE_ARCH = "OFF"
+
+[tool.cibuildwheel.linux]
+archs = ["x86_64"]
+manylinux-x86_64-image = "manylinux_2_28"
+before-all = "dnf install -y openssl-devel"
+repair-wheel-command = "auditwheel repair --strip -w {dest_dir} {wheel}"
+
+[tool.cibuildwheel.windows]
+archs = ["AMD64"]

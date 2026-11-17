@@ -3,3 +3,8 @@
 __pycache__/
 *.py[cod]
 .vsjet/
+dist/
+wheelhouse/
+*.egg-info/
+_skbuild/
+

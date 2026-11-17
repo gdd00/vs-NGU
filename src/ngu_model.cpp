@@ -5,7 +5,18 @@
 #include <bit>
 #include <cmath>
 #include <fstream>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <bcrypt.h>
+#else
 #include <openssl/evp.h>
+#endif
 #include <stdexcept>
 #include <utility>
 
@@ -25,11 +36,24 @@ std::vector<unsigned char> load_bytes(const std::filesystem::path &root, const F
         throw std::runtime_error("parameter size mismatch: " + label);
 
     // Hash the very snapshot we decode; never reopen after verification.
+#ifdef _WIN32
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+    if (!BCRYPT_SUCCESS(status))
+        throw std::runtime_error("BCryptOpenAlgorithmProvider failed: " + label);
+    std::array<unsigned char, 32> digest{};
+    status = BCryptHash(alg, nullptr, 0, bytes.data(), static_cast<ULONG>(bytes.size()), digest.data(), static_cast<ULONG>(digest.size()));
+    BCryptCloseAlgorithmProvider(alg, 0);
+    if (!BCRYPT_SUCCESS(status))
+        throw std::runtime_error("BCryptHash failed: " + label);
+    constexpr unsigned int length = 32;
+#else
     std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
     unsigned int length = 0;
     if (EVP_Digest(bytes.data(), bytes.size(), digest.data(), &length, EVP_sha256(), nullptr) != 1 ||
         length != 32)
         throw std::runtime_error("SHA-256 failed: " + label);
+#endif
     constexpr char hex[] = "0123456789abcdef";
     std::string actual;
     actual.reserve(64);

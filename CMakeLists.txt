@@ -2,10 +2,40 @@ cmake_minimum_required(VERSION 3.20)
 project(vs_ngu VERSION 0.1.0 LANGUAGES CXX)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(VS REQUIRED IMPORTED_TARGET vapoursynth>=82)
-find_package(OpenSSL REQUIRED COMPONENTS Crypto)
-include(CTest)
+
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(VS IMPORTED_TARGET vapoursynth>=82)
+endif()
+
+if(NOT TARGET PkgConfig::VS)
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" -c "import os, vapoursynth; print(os.path.join(os.path.dirname(vapoursynth.__file__), 'include'))"
+        OUTPUT_VARIABLE VAPOURSYNTH_PY_INCLUDE
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    find_path(VAPOURSYNTH_INCLUDE_DIR
+        NAMES VapourSynth4.h
+        HINTS "${VAPOURSYNTH_PY_INCLUDE}"
+        PATH_SUFFIXES vapoursynth/include vapoursynth include
+    )
+    if(NOT VAPOURSYNTH_INCLUDE_DIR)
+        message(FATAL_ERROR "VapourSynth4.h not found. Ensure vapoursynth>=82 is installed.")
+    endif()
+    add_library(PkgConfig::VS INTERFACE IMPORTED)
+    target_include_directories(PkgConfig::VS INTERFACE "${VAPOURSYNTH_INCLUDE_DIR}")
+endif()
+
+if(WIN32)
+    # Windows native crypto via BCrypt (CNG)
+else()
+    find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+endif()
+
+if(NOT SKBUILD)
+    include(CTest)
+endif()
 include(GNUInstallDirs)
 
 option(NGU_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
@@ -14,7 +44,8 @@ option(NGU_DUMP_SHADERS "Enable opt-in NGU_SHADER_DUMP_DIR precision audit dumps
 add_library(ngu_build_options INTERFACE)
 target_compile_features(ngu_build_options INTERFACE cxx_std_20)
 if(MSVC)
-    target_compile_options(ngu_build_options INTERFACE /W4 /WX /fp:strict)
+    target_compile_options(ngu_build_options INTERFACE /W4 /fp:strict /utf-8)
+    target_compile_definitions(ngu_build_options INTERFACE NOMINMAX WIN32_LEAN_AND_MEAN)
 else()
     target_compile_options(ngu_build_options INTERFACE
         -Wall -Wextra -Wpedantic -Werror -fno-fast-math -ffp-contract=off)
@@ -39,11 +70,42 @@ add_custom_command(OUTPUT "${catalog_header}"
 add_library(ngu_cpu STATIC src/ngu_cpu.cpp src/ngu_model.cpp "${catalog_header}")
 set_target_properties(ngu_cpu PROPERTIES POSITION_INDEPENDENT_CODE ON CXX_VISIBILITY_PRESET hidden)
 target_include_directories(ngu_cpu PUBLIC src PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
-target_link_libraries(ngu_cpu PUBLIC ngu_build_options PRIVATE OpenSSL::Crypto)
+if(WIN32)
+    target_link_libraries(ngu_cpu PUBLIC ngu_build_options PRIVATE bcrypt)
+else()
+    target_link_libraries(ngu_cpu PUBLIC ngu_build_options PRIVATE OpenSSL::Crypto)
+endif()
+
+find_path(VULKAN_INCLUDE_DIR NAMES vulkan/vulkan_core.h)
+set(VULKAN_1_4_FOUND FALSE)
+if(VULKAN_INCLUDE_DIR)
+    file(READ "${VULKAN_INCLUDE_DIR}/vulkan/vulkan_core.h" VULKAN_CORE_H)
+    if(VULKAN_CORE_H MATCHES "VK_VERSION_1_4")
+        set(VULKAN_1_4_FOUND TRUE)
+    endif()
+endif()
+
+if(NOT VULKAN_1_4_FOUND)
+    message(STATUS "Vulkan 1.4 headers not found, fetching Vulkan-Headers v1.4.304 via FetchContent...")
+    include(FetchContent)
+    FetchContent_Declare(
+        vulkan_headers
+        GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
+        GIT_TAG v1.4.304
+    )
+    FetchContent_MakeAvailable(vulkan_headers)
+endif()
 
 add_library(ngu_vulkan STATIC src/ngu_vulkan.cpp)
 set_target_properties(ngu_vulkan PROPERTIES POSITION_INDEPENDENT_CODE ON CXX_VISIBILITY_PRESET hidden)
 target_link_libraries(ngu_vulkan PUBLIC ngu_cpu PkgConfig::VS)
+if(TARGET Vulkan-Headers)
+    target_link_libraries(ngu_vulkan PUBLIC Vulkan-Headers)
+elseif(TARGET Vulkan::Headers)
+    target_link_libraries(ngu_vulkan PUBLIC Vulkan::Headers)
+elseif(VULKAN_INCLUDE_DIR)
+    target_include_directories(ngu_vulkan PUBLIC "${VULKAN_INCLUDE_DIR}")
+endif()
 target_compile_definitions(ngu_vulkan PUBLIC VS_USE_API_43)
 if(NGU_DUMP_SHADERS)
     target_compile_definitions(ngu_vulkan PRIVATE NGU_DUMP_SHADERS)
@@ -53,10 +115,18 @@ add_library(vsngu MODULE src/vs_plugin.cpp)
 set_target_properties(vsngu PROPERTIES PREFIX "" CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
 target_link_libraries(vsngu PRIVATE ngu_vulkan)
 target_compile_definitions(vsngu PRIVATE VS_USE_API_43)
-install(TARGETS vsngu LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}/vapoursynth")
+
+if(SKBUILD)
+    install(TARGETS vsngu LIBRARY DESTINATION . RUNTIME DESTINATION .)
+else()
+    install(TARGETS vsngu
+        LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}/vapoursynth"
+        RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}/vapoursynth"
+    )
+endif()
 # No weights, original bytecode, PE files or research products are installed.
 
-if(BUILD_TESTING)
+if(BUILD_TESTING AND NOT SKBUILD)
     set(NGU_WEIGHTS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/weights" CACHE PATH
         "Common root containing weights/ (FP32) and weights-fp16/ (FP16)")
     set(NGU_MADVR_SOURCE "" CACHE FILEPATH
