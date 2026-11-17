@@ -119,13 +119,6 @@ cmake --install build/native
 
 The output is `build/native/vsngu.so` on Linux or `build/native/vsngu.dll` on Windows.
 
-CMake options:
-
-- `NGU_NATIVE_ARCH` (default `ON`): adds `-march=native` on GCC/Clang. The binary is then tuned for the build machine and may not run on other CPUs. Turn it off for portable builds; release wheels are built with `OFF`. It does nothing under MSVC.
-- `BUILD_TESTING` (default `ON`): builds the test suite. The tests also need the VapourSynth core library and the extracted weights (`-D NGU_WEIGHTS_ROOT=path/to/weights`). Run them with `ctest --test-dir build/native`.
-- `NGU_SANITIZE` (default `OFF`): builds with ASan and UBSan.
-- `NGU_DUMP_SHADERS` (default `OFF`): enables shader dumps for precision audits, written to the `NGU_SHADER_DUMP_DIR` directory.
-
 To build a wheel locally:
 
 ```bash
