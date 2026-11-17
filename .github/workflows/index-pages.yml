@@ -20,14 +20,22 @@ jobs:
     name: Build PEP 503 index
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
       - name: Generate index
         env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: python scripts/generate_index.py --output _site
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p _site/simple/vapoursynth-ngu
+          gh api --paginate "repos/${{ github.repository }}/releases" --jq '
+            .[] | select(.draft | not) | .assets[]
+            | select((.name | endswith(".whl")) and ((.digest // "") | startswith("sha256:")))
+            | "<a href=\"\(.browser_download_url)#\(.digest | sub(":"; "="))\">\(.name)</a><br>"
+          ' > links.html
+          {
+            echo '<!doctype html><html><body>'
+            cat links.html
+            echo '</body></html>'
+          } > _site/simple/vapoursynth-ngu/index.html
+          echo '<!doctype html><html><body><a href="vapoursynth-ngu/">vapoursynth-ngu</a></body></html>' > _site/simple/index.html
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
