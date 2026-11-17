@@ -1,9 +1,9 @@
 #define VK_NO_PROTOTYPES
 #include <VSVulkan4.h>
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -11,15 +11,21 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 const VSAPI *api;
+constexpr int threads=8;
+// Bound requested-but-not-released frames, not just running callbacks.
+constexpr int maxInFlight=threads;
 struct Map {
     VSMap *p = api->createMap();
     ~Map() { api->freeMap(p); }
 };
 struct NodeDelete { void operator()(VSNode *p) const { if (p) api->freeNode(p); } };
 using Node = std::unique_ptr<VSNode, NodeDelete>;
+struct FrameDelete { void operator()(const VSFrame *p) const { if (p) api->freeFrame(p); } };
+using Frame = std::unique_ptr<const VSFrame, FrameDelete>;
 void check(bool ok, const std::string &s) { if (!ok) throw std::runtime_error(s); }
 void integer(Map &m, const char *key, std::int64_t value) {
     check(!api->mapSetInt(m.p,key,value,maReplace),key);
@@ -40,12 +46,12 @@ struct Sync {
     const VSVULKANAPI *gpu = nullptr;
     VSGPUExecPool *pool = nullptr;
     ~Sync() { if (pool) gpu->freeGPUExecPool(pool); }
-    void fence(const std::vector<const VSFrame *> &frames) {
+    void fence(const VSFrame *frame) {
         if (!pool) return;
         char error[1024]{};
         auto *exec=gpu->gpuExecAcquire(pool,error,sizeof(error));
         check(exec!=nullptr,error);
-        for (auto *f:frames) gpu->gpuExecReadsFrame(exec,f);
+        gpu->gpuExecReadsFrame(exec,frame);
         std::uint64_t value=0;
         check(!gpu->gpuExecSubmit(exec,&value,error,sizeof(error)),error);
         check(gpu->gpuExecWaitValue(pool,value,error,sizeof(error))==gdDrained,error);
@@ -60,14 +66,20 @@ struct Completion {
     std::mutex mutex;
     std::condition_variable ready;
     int count=0;
-    std::vector<const VSFrame *> frames;
+    int submitted=0;
+    std::deque<Frame> frames;
     std::string error;
+    ~Completion() {
+        // Even on a validation/fence error, callbacks must not outlive this state.
+        std::unique_lock lock(mutex);
+        ready.wait(lock,[&]{return count==submitted;});
+    }
 };
 void VS_CC complete(void *user, const VSFrame *f, int, VSNode *, const char *error) {
     auto &c=*static_cast<Completion *>(user);
     std::lock_guard lock(c.mutex);
     if (error) c.error=error;
-    if (f) c.frames.push_back(f);
+    c.frames.emplace_back(f);
     ++c.count;
     c.ready.notify_one();
 }
@@ -81,19 +93,26 @@ struct Case {
 };
 double window(Case &c, int frames, Sync &sync) {
     Completion completion;
-    completion.frames.reserve(frames);
-    const auto start=std::chrono::steady_clock::now();
-    for (int n=0;n<frames;++n)
+    const auto submit=[&] {
+        ++completion.submitted;
         api->getFrameAsync(c.next++,c.output.get(),complete,&completion);
-    {
-        std::unique_lock lock(completion.mutex);
-        completion.ready.wait(lock,[&]{return completion.count==frames;});
-    }
-    check(completion.error.empty(),completion.error);
-    check(static_cast<int>(completion.frames.size())==frames,"missing frames");
-    sync.fence(completion.frames); // Real GPU completion, not merely graph readiness.
-    const auto stop=std::chrono::steady_clock::now();
-    for (auto *f:completion.frames) {
+    };
+    const auto start=std::chrono::steady_clock::now();
+    for (int n=0;n<std::min(frames,maxInFlight);++n) submit();
+    std::chrono::steady_clock::time_point stop;
+    for (int n=0;n<frames;++n) {
+        Frame frame;
+        {
+            std::unique_lock lock(completion.mutex);
+            completion.ready.wait(lock,[&]{return !completion.frames.empty();});
+            frame=std::move(completion.frames.front());
+            completion.frames.pop_front();
+            check(completion.error.empty(),completion.error);
+        }
+        check(frame!=nullptr,"missing frames");
+        const auto *f=frame.get();
+        sync.fence(f); // Real GPU completion, not merely graph readiness.
+        if (n==frames-1) stop=std::chrono::steady_clock::now();
         check(api->getVideoFrameFormat(f)->bitsPerSample==c.bits,"wrong format");
         check(api->getFrameResidency(f)==(sync.pool?nrGPU:nrCPU),"wrong residency");
         const char *precision=api->mapGetData(api->getFramePropertiesRO(f),"_NGUPrecision",0,nullptr);
@@ -102,9 +121,11 @@ double window(Case &c, int frames, Sync &sync) {
         check(c.compute==precision,"compute precision changed");
         const char *weights=api->mapGetData(api->getFramePropertiesRO(f),"_NGUWeightPrecision",0,nullptr);
         check(weights&&c.precision==weights,"weight precision does not match input format");
-        api->freeFrame(f);
+        // A slot includes GPU-pending and ready frames; refill only after release.
+        frame.reset();
+        if (completion.submitted<frames) submit();
     }
-    sync.drain(); // Release benchmark-owned references outside the measured window.
+    sync.drain(); // Release the fence pool's references outside the measured window.
     return std::chrono::duration<double,std::milli>(stop-start).count()/frames;
 }
 int main(int argc,char **argv) {
@@ -120,7 +141,7 @@ int main(int argc,char **argv) {
         check(api!=nullptr,"API 4.3 required");
         std::unique_ptr<VSCore,decltype(api->freeCore)> core(api->createCore(ccfDisableAutoLoading),api->freeCore);
         check(core!=nullptr,"core creation");
-        api->setThreadCount(8,core.get());
+        api->setThreadCount(threads,core.get());
         Map load; string(load,"path",argv[1]);
         VSMap *loaded=api->invoke(api->getPluginByNamespace("std",core.get()),"LoadPlugin",load.p);
         const char *e=api->mapGetError(loaded);
@@ -136,6 +157,7 @@ int main(int argc,char **argv) {
         }
         std::vector<Case> cases;
         for (int bits:{32,16}) {
+            api->clearCoreCaches(core.get());
             const char *precision=bits==16?"fp16":"fp32";
             Map args;
             integer(args,"width",width); integer(args,"height",height);
@@ -150,7 +172,7 @@ int main(int argc,char **argv) {
                 char error[1024]{};
                 const VSFrame *first=api->getFrame(0,input.get(),error,sizeof(error));
                 check(first!=nullptr,error);
-                sync.fence({first});
+                sync.fence(first);
                 api->freeFrame(first);
                 sync.drain();
             }
@@ -165,14 +187,14 @@ int main(int argc,char **argv) {
             Node output=invoke(core.get(),"ngu","NGU2x",ngu);
             api->setCacheMode(output.get(),cmForceDisable);
             cases.push_back(Case{std::move(output),bits,precision,"",0,{}});
-        }
-        // All shader compilation, uploads and workspace warm-up precede timing.
-        for (auto &c:cases) window(c,warm,sync);
-        // Only the two format-matched archives are legal now. Alternate
-        // their order between trials; archived four-way runs are historical.
-        for (int trial=0;trial<trials;++trial) for (int j=0;j<2;++j) {
-            auto &c=cases[trial%2?1-j:j];
-            c.milliseconds.push_back(window(c,frames,sync));
+            auto &c=cases.back();
+            // Compilation, uploads and workspace warm-up precede this case's timing.
+            window(c,warm,sync);
+            for (int trial=0;trial<trials;++trial)
+                c.milliseconds.push_back(window(c,frames,sync));
+            // Keep only the results: do not park both precisions' workspaces.
+            c.output.reset();
+            sync.drain();
         }
         std::cout<<std::setprecision(10);
         for (auto &c:cases) {
@@ -183,7 +205,7 @@ int main(int argc,char **argv) {
                      <<",\"mode\":\""<<mode<<"\",\"weights\":\""<<c.precision<<"\",\"clip_bits\":"<<c.bits
                      <<",\"compute_precision\":\""<<c.compute<<"\""
                      <<",\"frames_per_trial\":"<<frames<<",\"trials\":"<<trials
-                     <<",\"warmup_frames\":"<<warm<<",\"threads\":8,\"median_ms\":"<<median
+                     <<",\"warmup_frames\":"<<warm<<",\"threads\":"<<threads<<",\"median_ms\":"<<median
                      <<",\"fps\":"<<1000/median<<",\"trial_ms\":[";
             for (std::size_t i=0;i<c.milliseconds.size();++i)
                 std::cout<<(i?",":"")<<c.milliseconds[i];
