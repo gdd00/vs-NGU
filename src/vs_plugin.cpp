@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -45,6 +46,18 @@ std::string get_string(const VSMap *in, const char *key, const char *fallback, c
     if (error || size <= 0 || std::memchr(value, 0, static_cast<std::size_t>(size)))
         throw std::invalid_argument(std::string(key) + " must be a non-empty string without NUL");
     return {value, static_cast<std::size_t>(size)};
+}
+
+std::filesystem::path weights_root(const VSMap *in, const VSPlugin *plugin, const VSAPI *api) {
+    if (api->mapNumElements(in, "weights") >= 0) {
+        const auto root = get_string(in, "weights", nullptr, api);
+        return std::filesystem::path(std::u8string(root.begin(), root.end()));
+    }
+    const char *path = api->getPluginPath(plugin);
+    if (!path || !*path)
+        throw std::runtime_error("cannot determine the plugin path; pass weights explicitly");
+    const std::filesystem::path library(std::u8string(path, path + std::strlen(path)));
+    return library.parent_path() / "weights";
 }
 
 bool is_gray_float(const VSVideoFormat &f) noexcept {
@@ -118,7 +131,7 @@ void VS_CC free_filter(void *instance, VSCore *, const VSAPI *) {
     delete static_cast<Filter *>(instance);
 }
 
-void VS_CC create(const VSMap *in, VSMap *out, void *, VSCore *core, const VSAPI *api) {
+void VS_CC create(const VSMap *in, VSMap *out, void *user_data, VSCore *core, const VSAPI *api) {
     try {
         int error = 0;
         NodePtr input(api->mapGetNode(in, "clip", 0, &error), NodeDeleter{api});
@@ -141,7 +154,6 @@ void VS_CC create(const VSMap *in, VSMap *out, void *, VSCore *core, const VSAPI
             throw std::invalid_argument("constant format and dimensions, GRAYS/GRAYH (float32/float16, one plane) required");
         ngu::validate_2x_dimensions(vi->width, vi->height);
 
-        const std::string root = get_string(in, "weights", nullptr, api);
         const std::string mode = get_string(in, "mode", "sharp", api);
         const std::string quality = get_string(in, "quality", "medium", api);
         std::int64_t option = 0;
@@ -161,12 +173,12 @@ void VS_CC create(const VSMap *in, VSMap *out, void *, VSCore *core, const VSAPI
             if (precision != expected_precision)
                 throw std::invalid_argument(std::string("weights_precision conflicts with input format: ") +
                     (half ? "GRAYH requires fp16 (weights-fp16/)" : "GRAYS requires fp32 (weights/)") +
-                    "; omit weights_precision and pass the common weights root");
+                    "; omit weights_precision to select the archive by input format");
         }
         const auto weight_precision = half ? ngu::WeightPrecision::FP16 : ngu::WeightPrecision::FP32;
         const ngu::ModelSpec &spec = ngu::select_model(mode, quality, option);
-        ngu::Model model = ngu::load_model(
-            std::filesystem::path(std::u8string(root.begin(), root.end())), spec, weight_precision);
+        const auto root = weights_root(in, static_cast<const VSPlugin *>(user_data), api);
+        ngu::Model model = ngu::load_model(root, spec, weight_precision);
         VSVideoInfo output_info = *vi;
         output_info.width *= 2;
         output_info.height *= 2;
@@ -198,7 +210,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
         VS_MAKE_VERSION(0, 1), VS_MAKE_VERSION(4, 3), 0, plugin))
         return;
     api->registerFunction("NGU2x",
-        "clip:vnode:all;weights:data;mode:data:opt;quality:data:opt;option:int:opt;backend:data:opt;"
+        "clip:vnode:all;weights:data:opt;mode:data:opt;quality:data:opt;option:int:opt;backend:data:opt;"
         "weights_precision:data:opt;",
-        "clip:vnode:all;", create, nullptr, plugin);
+        "clip:vnode:all;", create, plugin, plugin);
 }

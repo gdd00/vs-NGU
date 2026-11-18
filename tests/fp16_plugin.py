@@ -7,11 +7,15 @@ import ctypes
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import random
 import shutil
 import struct
+import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 
 import vapoursynth as vs
@@ -371,6 +375,9 @@ class FP16Tests(unittest.TestCase):
                 # weights exist at all.
                 with self.assertRaisesRegex(vs.Error, "weights_precision conflicts.*requires " + expected):
                     self.output(clip, model, other, backend, weights="/nonexistent/ngu-weights")
+                for weights in ("", "weights\0trailing"):
+                    with self.assertRaisesRegex(vs.Error, "weights must be a non-empty string without NUL"):
+                        self.output(clip, model, backend=backend, weights=weights)
                 for precision in ("", "FP16", "auto", "fp16\0", "bf16"):
                     with self.assertRaisesRegex(vs.Error, "weights_precision"):
                         self.output(clip, model, precision, backend)
@@ -399,6 +406,44 @@ class FP16Tests(unittest.TestCase):
         with self.assertRaisesRegex(vs.Error, "FP16 overflow"):
             out.get_frame(0)
         self.assertTrue(all(math.isfinite(v) for v in frame_values(out.get_frame(1))))
+
+    def test_manifestless_plugin_autoload(self):
+        model = "sharp_2x_low"
+        with tempfile.TemporaryDirectory() as tmp:
+            plugins = Path(tmp) / "plugins"
+            directory = plugins / "vsngu"
+            directory.mkdir(parents=True)
+            plugin = directory / ARGS.plugin.name
+            shutil.copy2(ARGS.plugin, plugin)
+            for child in ("weights", "weights-fp16"):
+                shutil.copytree(ARGS.weights / child / model, directory / "weights" / child / model)
+            # Create the core after setting the extra path, without changing
+            # the existing test core or calling LoadPlugin in the child.
+            script = textwrap.dedent("""
+                from pathlib import Path
+                import sys
+                import unittest
+                import vapoursynth as vs
+
+                check = unittest.TestCase()
+                core = vs.core
+                core.num_threads = 2
+                check.assertEqual(Path(core.ngu.plugin_path).resolve(), Path(sys.argv[1]).resolve())
+                for fmt, precision in ((vs.GRAYS, "fp32"), (vs.GRAYH, "fp16")):
+                    clip = core.std.BlankClip(width=3, height=2, length=1, format=fmt, color=0.375)
+                    implicit = core.ngu.NGU2x(clip, quality="low").get_frame(0)
+                    explicit = core.ngu.NGU2x(clip, quality="low", weights=sys.argv[2]).get_frame(0)
+                    check.assertEqual((implicit.width, implicit.height, implicit.format.id), (6, 4, fmt))
+                    check.assertEqual(implicit.props["_NGUWeightPrecision"], precision)
+                    check.assertEqual(implicit.props["_NGUBackend"], "cpu")
+                    check.assertEqual(bytes(implicit[0]), bytes(explicit[0]))
+                """)
+            result = subprocess.run(
+                [sys.executable, "-c", script, str(plugin.resolve()), str(ARGS.weights.resolve())],
+                cwd=tmp, env={**os.environ, "VAPOURSYNTH_EXTRA_PLUGIN_PATH": str(plugins.resolve())},
+                capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_format_selects_only_its_archive_without_fallback(self):
         model = self.models[0]

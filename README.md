@@ -6,31 +6,37 @@ The plugin is written against **madVR 0.92.17**. It does **not** ship any NGU we
 
 ## Weights
 
-Download madVR **0.92.17** from [videohelp.com/software/madVR](https://www.videohelp.com/software/madVR) and unpack it. Then run:
+The plugin does not download, extract or convert weights. Prepare them manually once.
+
+Download madVR **0.92.17** from [videohelp.com/software/madVR](https://www.videohelp.com/software/madVR) and unpack it. Then run both tools from this repository with the same `--weights-root`:
 
 ```bash
-# 1. Extract the FP32 archive into weights/weights/
+# 1. Extract the FP32 archive into <weights-root>/weights/
 python tools/extract_ngu_models.py path/to/madvr/raw/madVR09217/madVR64.ax --weights-root weights
 
-# 2. Convert it to an FP16 archive in weights/weights-fp16/
+# 2. Convert it to an FP16 archive in <weights-root>/weights-fp16/
 python tools/convert_ngu_fp16.py --weights-root weights
 ```
 
+`--weights-root` defaults to `weights/` in the repository. To install straight into the default plugin location, pass `<plugin-dir>/vsngu/weights` instead (see [Installation](#installation)).
+
 Both tools need only the Python standard library. Extraction reads the PE file offline and never runs code from it. Neither tool overwrites an existing output directory.
 
-You end up with one common root, which is what the `weights` argument expects:
+You end up with one common weights root:
 
 ```
-weights/
+weights/            # common weights root: the path you pass as weights=
 ├── weights/        # FP32, used for GRAYS input
 └── weights-fp16/   # FP16, used for GRAYH input
 ```
+
+The common root is the directory that *contains* `weights/` and `weights-fp16/`. Do not pass either child directory as the root.
 
 ## Usage
 
 Prototype:
 
-`core.ngu.NGU2x(vnode clip, string weights[, string mode = "sharp", string quality = "medium", int option = 0, string backend = "auto", string weights_precision])`
+`core.ngu.NGU2x(vnode clip[, string weights, string mode = "sharp", string quality = "medium", int option = 0, string backend = "auto", string weights_precision])`
 
 Output is exactly 2x the input width and height. The plugin adds these frame properties: `_NGUModel`, `_NGUPrecision`, `_NGUWeightPrecision` and `_NGUBackend`.
 
@@ -43,7 +49,7 @@ Arguments:
   - Where the clip lives chooses the backend:
     - A CPU-resident clip runs on the CPU backend.
     - A GPU-resident clip (from `std.GPUUpload`, VapourSynth R82+) runs on the Vulkan backend.
-- `string weights`: Path to the common weights root described above. Required.
+- `string weights`: Optional path to the common weights root described above. If omitted, NGU2x reads from the `weights/` directory next to the loaded plugin library (for a pip install, `vapoursynth/plugins/vsngu/weights/`). It does not download, extract, or convert weights.
 - `string mode`: NGU variant. One of `"aa"`, `"soft"`, `"standard"`, `"sharp"`. Default `"sharp"`.
 - `string quality`: One of `"low"`, `"medium"`, `"high"`, `"very_high"`. Default `"medium"`.
 - `int option`: Range `0..14`, default `0`. Selects one of the alternative Sharp parameter sets that madVR uses internally.
@@ -76,12 +82,15 @@ core = vs.core
 
 y = core.std.ShufflePlanes(src, 0, vs.GRAY).resize.Point(format=vs.GRAYS)
 
-# CPU, FP32
+# CPU, FP32, weights from the default root vapoursynth/plugins/vsngu/weights/
+up = core.ngu.NGU2x(y, mode="sharp", quality="high")
+
+# Pass weights="path/to/weights" (the common root) to override the default root
 up = core.ngu.NGU2x(y, weights="path/to/weights", mode="sharp", quality="high")
 
-# Vulkan, FP16 (VapourSynth R82+)
+# Vulkan, FP16 (VapourSynth R82+), weights from the default root
 gpu = core.std.GPUUpload(y.resize.Point(format=vs.GRAYH))
-up = core.ngu.NGU2x(gpu, weights="path/to/weights", mode="sharp", quality="very_high", option=14)
+up = core.ngu.NGU2x(gpu, mode="sharp", quality="very_high", option=14)
 up = core.std.GPUDownload(up)
 ```
 
@@ -89,7 +98,7 @@ See also [examples/ngu2x.vpy](examples/ngu2x.vpy).
 
 ## Installation
 
-Prebuilt wheels for Windows x64 and Linux x86_64 need Python 3.12+ and VapourSynth R82+. pip installs the plugin into VapourSynth's `plugins` directory inside site-packages, where VapourSynth autoloads it.
+Prebuilt wheels for Windows x64 and Linux x86_64 need Python 3.12+ and VapourSynth R82+. pip installs the plugin at `vapoursynth/plugins/vsngu/vsngu.so` (Windows: `vsngu.dll`) inside site-packages, where VapourSynth autoloads it.
 
 Windows and Linux use the same command; pip picks the matching wheel automatically:
 
@@ -97,7 +106,29 @@ Windows and Linux use the same command; pip picks the matching wheel automatical
 pip install --extra-index-url https://gdd00.github.io/vs-NGU/simple/ vapoursynth-ngu
 ```
 
-The weights are not included. See [Weights](#weights).
+The weights are not included. To omit the `weights` argument, the common root from [Weights](#weights) must be the `weights/` directory next to the plugin library:
+
+```
+vapoursynth/plugins/            # <plugin-dir>
+└── vsngu/
+    ├── vsngu.so                # Windows: vsngu.dll
+    └── weights/                # common weights root (default)
+        ├── weights/            # FP32
+        └── weights-fp16/       # FP16
+```
+
+Note the two levels of `weights/`: `vsngu/weights/weights/` holds the FP32 archive. Locate `<plugin-dir>` with:
+
+```bash
+python -c "import vapoursynth as vs; print(vs.get_plugin_dir())"
+```
+
+This prints the `vapoursynth/plugins` directory in site-packages; the plugin is in its `vsngu/` subdirectory. Then either:
+
+- run the tools from [Weights](#weights) with `--weights-root <plugin-dir>/vsngu/weights`, or
+- move the generated `weights/` and `weights-fp16/` directories into `<plugin-dir>/vsngu/weights/`.
+
+You can also keep the weights anywhere else and pass the common root explicitly with `weights=`.
 
 ## Building
 
@@ -117,7 +148,7 @@ cmake --build build/native
 cmake --install build/native
 ```
 
-The output is `build/native/vsngu.so` on Linux or `build/native/vsngu.dll` on Windows.
+The build output is `build/native/vsngu.so` on Linux or `build/native/vsngu.dll` on Windows. Native installation uses `${CMAKE_INSTALL_LIBDIR}/vapoursynth/vsngu/` for library artifacts and `${CMAKE_INSTALL_BINDIR}/vapoursynth/vsngu/` for runtime artifacts. The default weights root is still the `weights/` directory next to the installed library.
 
 To build a wheel locally:
 

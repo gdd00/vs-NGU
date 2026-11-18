@@ -93,6 +93,8 @@ if(NOT VULKAN_1_4_FOUND)
         GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
         GIT_TAG v1.4.304
     )
+    # Use the headers for compilation only; do not install dependency files.
+    set(VULKAN_HEADERS_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(vulkan_headers)
 endif()
 
@@ -117,11 +119,14 @@ target_link_libraries(vsngu PRIVATE ngu_vulkan)
 target_compile_definitions(vsngu PRIVATE VS_USE_API_43)
 
 if(SKBUILD)
-    install(TARGETS vsngu LIBRARY DESTINATION . RUNTIME DESTINATION .)
+    install(TARGETS vsngu
+        LIBRARY DESTINATION "vapoursynth/plugins/vsngu"
+        RUNTIME DESTINATION "vapoursynth/plugins/vsngu"
+    )
 else()
     install(TARGETS vsngu
-        LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}/vapoursynth"
-        RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}/vapoursynth"
+        LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}/vapoursynth/vsngu"
+        RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}/vapoursynth/vsngu"
     )
 endif()
 # No weights, original bytecode, PE files or research products are installed.

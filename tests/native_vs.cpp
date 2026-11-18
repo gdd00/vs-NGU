@@ -6,17 +6,20 @@
 #include "ngu_vulkan.hpp"
 #include "half_reference.hpp"
 
+#include <algorithm>
 #include <array>
-
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
@@ -44,6 +47,15 @@ void text_arg(VSMap *map, const char *name, const char *value) {
 }
 void int_arg(VSMap *map, const char *name, std::int64_t value) {
     check(api->mapSetInt(map, name, value, maReplace) == 0, "cannot set int");
+}
+
+void load_plugin(VSCore *core, const char *path) {
+    Map args;
+    text_arg(args.value, "path", path);
+    std::unique_ptr<VSMap, decltype(api->freeMap)> loaded(
+        api->invoke(api->getPluginByNamespace("std", core), "LoadPlugin", args.value), api->freeMap);
+    const char *error = api->mapGetError(loaded.get());
+    check(!error, error ? error : "");
 }
 
 float pattern_sample(int x, int y, int n) {
@@ -160,7 +172,8 @@ VSNode *filter(VSCore *core, VSNode *source, const char *weights, const char *mo
                const char *weights_precision = nullptr) {
     Map args;
     api->mapSetNode(args.value, "clip", source, maReplace);
-    text_arg(args.value, "weights", weights);
+    if (weights)
+        text_arg(args.value, "weights", weights);
     text_arg(args.value, "mode", mode);
     text_arg(args.value, "quality", quality);
     int_arg(args.value, "option", option);
@@ -652,6 +665,114 @@ void test_format_precision_errors(VSCore *core) {
     }
 }
 
+namespace fs = std::filesystem;
+
+struct TempDir {
+    fs::path path;
+    TempDir() {
+        const auto base = fs::canonical(fs::temp_directory_path());
+        std::random_device random;
+        do {
+            path = base / ("vsngu-test-" + std::to_string(random()));
+        } while (!fs::create_directory(path));
+    }
+    ~TempDir() {
+        std::error_code ignored;
+        fs::remove_all(path, ignored);
+    }
+    TempDir(const TempDir &) = delete;
+    TempDir &operator=(const TempDir &) = delete;
+};
+
+void test_adjacent_weights(const char *plugin_path, const char *root) {
+    const TempDir temp;
+    const auto directory = temp.path / "vsngu";
+    fs::create_directory(directory);
+    const auto library = directory / fs::path(plugin_path).filename();
+    fs::copy_file(plugin_path, library);
+
+    // Unload the copy before TempDir removes it, including on Windows.
+    std::unique_ptr<VSCore, decltype(api->freeCore)> core_guard(
+        api->createCore(ccfDisableAutoLoading | ccfEnableFrameRefDebug), api->freeCore);
+    VSCore *core = core_guard.get();
+    check(core != nullptr, "createCore for adjacent weights failed");
+    api->setThreadCount(8, core);
+    const auto library_utf8 = library.u8string();
+    load_plugin(core, reinterpret_cast<const char *>(library_utf8.c_str()));
+
+    using Node = std::unique_ptr<VSNode, decltype(api->freeNode)>;
+    using Frame = std::unique_ptr<const VSFrame, decltype(api->freeFrame)>;
+    const auto adjacent = directory / "weights";
+    const auto &spec = ngu::select_model("sharp", "low", 0);
+    for (int bits : {32, 16}) {
+        const bool half = bits == 16;
+        const char *precision = half ? "fp16" : "fp32";
+        const auto archive = adjacent / (half ? "weights-fp16" : "weights");
+        const auto model = ngu::load_model(root, spec, half ? ngu::WeightPrecision::FP16 : ngu::WeightPrecision::FP32);
+        auto samples = pattern(3, 2, 0);
+        if (half)
+            for (float &sample : samples.values) sample = ngu::round_half(sample);
+        const auto cpu_expected = ngu::run(model, samples);
+        const auto gpu_expected = half ? half_reference::run(model, samples) : cpu_expected;
+        const auto counts = std::make_shared<Counts>();
+        Node source(make_source(core, counts, -1, -1, -1, bits, 3, 2), api->freeNode);
+        Node upload(transfer(core, source.get(), "GPUUpload"), api->freeNode);
+
+        const auto expect_error = [&](const char *assertion, std::string expected) {
+            std::replace(expected.begin(), expected.end(), '\\', '/');
+            for (VSNode *input : {source.get(), upload.get()}) {
+                std::string message;
+                try {
+                    const Node out(filter(core, input, nullptr, "sharp", "low", 0, "auto", assertion), api->freeNode);
+                } catch (const std::exception &e) {
+                    message = e.what();
+                }
+                std::replace(message.begin(), message.end(), '\\', '/');
+                check(message.find(expected) != std::string::npos, "expected " + expected + "; got: " + message);
+            }
+        };
+        const auto infer = [&](const char *weights) {
+            for (VSNode *input : {source.get(), upload.get()}) {
+                const bool gpu = input == upload.get();
+                const Node out(filter(core, input, weights, "sharp", "low", 0), api->freeNode);
+                check(api->getNodeResidency(out.get()) == (gpu ? nrGPU : nrCPU), "wrong NGU output residency");
+                const Node readable(gpu ? transfer(core, out.get(), "GPUDownload") : api->addNodeRef(out.get()),
+                                    api->freeNode);
+                char error[1024]{};
+                const Frame frame(api->getFrame(0, readable.get(), error, sizeof(error)), api->freeFrame);
+                check(frame && api->getVideoFrameFormat(frame.get())->bitsPerSample == bits &&
+                      matches(frame.get(), gpu ? gpu_expected : cpu_expected, 0, gpu ? "vulkan" : "cpu", precision),
+                      std::string("adjacent weights inference failed: ") + precision + " " + error);
+            }
+        };
+
+        const std::string missing = std::string(half ? "missing FP16" : "missing FP32") +
+            " weights archive: " + archive.string();
+        expect_error(half ? "fp32" : "fp16", half ? "GRAYH requires fp16" : "GRAYS requires fp32");
+        expect_error(nullptr, missing); // Neither archive nor the default root exists.
+        infer(root);                   // Explicit root still works.
+        for (const char *child : {"weights", "weights-fp16"}) {
+            fs::create_directories(adjacent / child);
+            fs::copy(fs::path(root) / child / spec.id, adjacent / child / spec.id, fs::copy_options::recursive);
+        }
+        infer(nullptr);
+        fs::remove_all(archive);
+        expect_error(nullptr, missing); // The opposite archive exists but must not be used.
+        fs::remove_all(adjacent);
+        upload.reset();
+        source.reset();
+        api->clearCoreCaches(core);
+        check(counts->freed == 1, "adjacent weights test leaked source");
+    }
+
+    VSVulkanCoreInfo gpu_info{};
+    char gpu_error[1024]{};
+    const int result = api->getVulkanAPI()->getVulkanCoreInfo(core, &gpu_info, gpu_error, sizeof(gpu_error));
+    check(result == 0, std::string("adjacent weights GPU accounting query: ") + gpu_error);
+    check(gpu_info.allocated == 0, "adjacent weights GPU allocations were not released after cache sweep");
+    core_guard.reset();
+}
+
 void test_frame_error(VSCore *core, const char *root, int kind, bool gpu = false) {
     const auto counts = std::make_shared<Counts>();
     VSNode *source = make_source(core, counts, kind == 0 ? 0 : -1,
@@ -707,13 +828,7 @@ int main(int argc, char **argv) {
             std::cout << "core Vulkan init/free without NGU: status=" << result << " " << error << std::endl;
             return result;
         }
-        Map args;
-        text_arg(args.value, "path", argv[1]);
-        VSMap *loaded = api->invoke(api->getPluginByNamespace("std", core), "LoadPlugin", args.value);
-        const char *load_error = api->mapGetError(loaded);
-        const std::string message = load_error ? load_error : "";
-        api->freeMap(loaded);
-        check(message.empty(), message);
+        load_plugin(core, argv[1]);
         if (large) {
             test_gpu_half_large(core,argv[2]);
         } else {
@@ -745,9 +860,10 @@ int main(int argc, char **argv) {
             std::string("GPU accounting query: ") + gpu_error);
         check(gpu_info.allocated == 0, "GPU frames/scratch/weights were not released after cache sweep");
         core_guard.reset();
+        if (!large) test_adjacent_weights(argv[1], argv[2]);
         if (!large) std::cout << "native VS: 320 CPU + 280 GPU async requests (8 threads), format-selected FP32 / FP16 archives; GPU chain, explicit "
                      "download, retained frames, properties, errors, GPU accounting zero and repeated lifecycle; "
-                     "80 exact half-FMA tile graphs x default/compatible option, half/float fallback and precision guards passed"
+                     "80 exact half-FMA tile graphs x default/compatible option, half/float fallback, precision guards and adjacent weights passed"
                   << std::endl;
         return 0;
     } catch (const std::exception &e) {
