@@ -13,13 +13,16 @@ dependencies = [
     "vapoursynth>=82",
 ]
 
+[project.scripts]
+vsngu-weights = "vsngu.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/gdd00/vs-NGU"
 Repository = "https://github.com/gdd00/vs-NGU"
 
 [tool.scikit-build]
 wheel.exclude = ["*.lib", "*.exp"]
-wheel.packages = [] # Ship only the CMake install outputs.
+wheel.packages = ["python/vsngu"]
 wheel.py-api = "py3"
 cmake.build-type = "Release"
 cmake.define.NGU_NATIVE_ARCH = "OFF"

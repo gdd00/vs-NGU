@@ -123,6 +123,11 @@ if(SKBUILD)
         LIBRARY DESTINATION "vapoursynth/plugins/vsngu"
         RUNTIME DESTINATION "vapoursynth/plugins/vsngu"
     )
+    # Preserve the scripts' relative tools/ and models/ layout in the wheel.
+    install(FILES tools/extract_madvr.py tools/extract_ngu_models.py
+        tools/convert_ngu_fp16.py tools/generate_ngu_catalog.py
+        DESTINATION "vsngu/_bundled/tools")
+    install(FILES models/madvr09217-index.json DESTINATION "vsngu/_bundled/models")
 else()
     install(TARGETS vsngu
         LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}/vapoursynth/vsngu"
@@ -153,6 +158,23 @@ if(BUILD_TESTING AND NOT SKBUILD)
     endif()
     add_test(NAME weights_layout COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/weights_layout.py" ${layout_test_args})
+    set(cli_test_args --fp32 "${NGU_WEIGHTS_ROOT}/weights"
+        --plugin-name "$<TARGET_FILE_NAME:vsngu>")
+    if(NGU_MADVR_SOURCE)
+        list(APPEND cli_test_args --madvr "${NGU_MADVR_SOURCE}")
+    endif()
+    if(VULKAN_1_4_FOUND)
+        list(APPEND cli_test_args --wheel-define "VULKAN_INCLUDE_DIR=${VULKAN_INCLUDE_DIR}")
+    else()
+        list(APPEND cli_test_args --wheel-define
+            "FETCHCONTENT_SOURCE_DIR_VULKAN_HEADERS=${vulkan_headers_SOURCE_DIR}")
+    endif()
+    if(VAPOURSYNTH_INCLUDE_DIR)
+        list(APPEND cli_test_args --wheel-define "VAPOURSYNTH_INCLUDE_DIR=${VAPOURSYNTH_INCLUDE_DIR}")
+    endif()
+    add_test(NAME weights_cli COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/weights_cli.py" ${cli_test_args})
+    set_tests_properties(weights_cli PROPERTIES TIMEOUT 300)
 
     find_library(VS_CORE_LIBRARY NAMES vapoursynth REQUIRED)
     # Python-package installs may expose /usr/lib symlinks to the actual core.
