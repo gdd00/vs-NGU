@@ -58,6 +58,25 @@ class ExportTests(unittest.TestCase):
             self.assertIn("stage00.weights.f32le", proc.stderr)
             self.assertFalse(target.exists())
 
+    def test_fused_schedules_and_portable_shared_memory(self):
+        shapes = [
+            ("sharp_2x_low", False, [(1, 8, 3), (8, 8, 3), (8, 8, 3), (8, 1, 4)], 1),
+            ("aa_2x_low", True, [(1, 8, 3), (8, 8, 3), (8, 8, 3)] + [(8, 1, 3)] * 3, 1),
+            ("sharp_2x_medium", False, [(1, 12, 3), (12, 8, 3), (8, 8, 3), (8, 8, 3), (8, 8, 3), (8, 1, 4)], 2),
+            ("sharp_2x_high", False, [(1, 12, 3)] + [(12, 12, 3)] * 5 + [(12, 1, 4)], 4),
+            ("sharp_2x_very_high", False, [(1, 16, 3)] + [(16, 16, 3)] * 7 + [(16, 1, 4)], 5),
+            ("aa_2x_very_high", True, [(1, 16, 3)] + [(16, 16, 3)] * 7 + [(16, 1, 3)] * 3, 5),
+        ]
+        for model_id, aa, spec, expected_passes in shapes:
+            layers = [(ci, co, (0.015625,) * (ci * co * k * k), (0.00390625,) * co)
+                      for ci, co, k in spec]
+            for native_fp16 in (False, True):
+                glsl = export.render(model_id, layers, aa, native_fp16)
+                self.assertEqual(glsl.count("//!HOOK LUMA"), expected_passes)
+                self.assertEqual(glsl.count("//!COMPUTE "), expected_passes)
+                self.assertEqual("#define NGU_NATIVE_FP16 1" in glsl, native_fp16)
+                self.assertEqual("//!OFFSET -0.5 -0.5" in glsl, aa)
+
 
 if __name__ == "__main__":
     unittest.main()

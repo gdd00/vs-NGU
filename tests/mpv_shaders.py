@@ -141,7 +141,7 @@ def shader_labels(shader):
     assert re.findall(r"^//!HOOK (.*)$", shader, re.M) == ["LUMA"] * len(labels)
     assert re.findall(r"^//!WHEN (.*)$", shader, re.M) == [export.WHEN] * len(labels)
     assert shader.count("//!COMPUTE ") == len(labels)
-    assert 5 <= len(labels) <= 16
+    assert 1 <= len(labels) <= 16
     return labels
 
 
@@ -260,7 +260,11 @@ def pixels(args, work, models):
             check_hooks(log, labels, True)
             maximum, mae = luma_error(actual, grid)
             print(f"Y {model_id} {bits:2d}-bit max={maximum:.5f} MAE={mae:.5f}", flush=True)
-            assert maximum <= 1.0, f"{model_id}/{bits}: error exceeds 1/255 ({base})"
+            native_half = "#define NGU_NATIVE_FP16 1" in shader.read_text()
+            limit = 2.5 if native_half else 1.0
+            assert maximum <= limit, f"{model_id}/{bits}: error exceeds {limit}/255 ({base})"
+            if native_half:
+                assert mae <= 0.25, f"{model_id}/{bits}: native FP16 MAE exceeds 0.25/255 ({base})"
     if any(m[0]["family_id"] == 28 for m in models):
         model, shader, labels = next(m for m in models if m[0]["family_id"] == 28)
         base = work / "aa-alignment"
@@ -283,7 +287,8 @@ def pixels(args, work, models):
         bmax, bmae = color_error(actual, unaligned)
         print(f"AA phase (rendered color): correct max={amax:.5f} MAE={amae:.5f}; "
               f"zero-offset control max={bmax:.5f} MAE={bmae:.5f}", flush=True)
-        assert amax <= 1.0 and bmax > 1.0 and bmae > 4 * amae
+        alimit = 2.5 if "#define NGU_NATIVE_FP16 1" in shader.read_text() else 1.0
+        assert amax <= alimit and bmax > 1.0 and bmae > 4 * amae
 
 
 def suite(args, work):
