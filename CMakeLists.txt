@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(vs_ngu VERSION 0.1.3 LANGUAGES CXX)
+project(vs_ngu VERSION 0.1.4 LANGUAGES CXX)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
