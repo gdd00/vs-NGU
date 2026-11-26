@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -28,7 +29,11 @@ struct Filter {
     NodePtr input;
     VSVideoInfo input_info;
     VSVideoInfo output_info;
-    ngu::Model model;
+    std::string model_id;
+    const char *compute_precision;
+    const char *weight_precision;
+    const char *backend_name;
+    std::optional<ngu::Model> cpu_model;
     std::unique_ptr<ngu::Vulkan> vulkan;
 };
 
@@ -98,13 +103,12 @@ const VSFrame *VS_CC get_frame(int n, int reason, void *instance, void **,
         if (!raw)
             throw std::bad_alloc();
         VSMap *props = api->getFramePropertiesRW(raw);
-        if (api->mapSetData(props, "_NGUModel", d.model.id.c_str(), -1, dtUtf8, maReplace) ||
-            api->mapSetData(props, "_NGUPrecision",
-                d.vulkan && d.input_info.format.bitsPerSample == 16 ? "fp16" : "fp32", -1, dtUtf8, maReplace) ||
-            api->mapSetData(props, "_NGUWeightPrecision",
-                d.model.weight_precision == ngu::WeightPrecision::FP16 ? "fp16" : "fp32",
-                -1, dtUtf8, maReplace) ||
-            api->mapSetData(props, "_NGUBackend", d.vulkan ? "vulkan" : "cpu", -1, dtUtf8, maReplace))
+        if (api->mapSetData(props, "_NGUModel", d.model_id.c_str(),
+                static_cast<int>(d.model_id.size()), dtUtf8, maReplace) ||
+            api->mapSetData(props, "_NGUPrecision", d.compute_precision, 4, dtUtf8, maReplace) ||
+            api->mapSetData(props, "_NGUWeightPrecision", d.weight_precision, 4, dtUtf8, maReplace) ||
+            api->mapSetData(props, "_NGUBackend", d.backend_name,
+                d.vulkan ? 6 : 3, dtUtf8, maReplace))
             throw std::runtime_error("cannot set output frame properties");
         if (d.vulkan) {
             d.vulkan->process(source.get(), raw);
@@ -112,7 +116,9 @@ const VSFrame *VS_CC get_frame(int n, int reason, void *instance, void **,
             const ngu::Tensor input = ngu::read_plane(api->getReadPtr(source.get(), 0),
                 api->getStride(source.get(), 0), d.input_info.width, d.input_info.height,
                 d.input_info.format.bitsPerSample);
-            const ngu::Tensor result = ngu::run(d.model, input);
+            source.reset();
+            api->releaseFrameEarly(d.input.get(), n, context);
+            const ngu::Tensor result = ngu::run(*d.cpu_model, input);
             ngu::write_plane(result, api->getWritePtr(raw, 0), api->getStride(raw, 0),
                 d.output_info.format.bitsPerSample);
         }
@@ -182,11 +188,22 @@ void VS_CC create(const VSMap *in, VSMap *out, void *user_data, VSCore *core, co
         VSVideoInfo output_info = *vi;
         output_info.width *= 2;
         output_info.height *= 2;
+        std::string model_id = model.id;
+        const char *compute_prec = (use_vulkan && half) ? "fp16" : "fp32";
+        const char *weight_prec = (model.weight_precision == ngu::WeightPrecision::FP16) ? "fp16" : "fp32";
+        const char *backend_str = use_vulkan ? "vulkan" : "cpu";
+        std::unique_ptr<ngu::Vulkan> vulkan_engine;
+        std::optional<ngu::Model> cpu_model;
+        if (use_vulkan) {
+            // Upload parameters to VRAM and immediately discard host-side weight vectors.
+            vulkan_engine = std::make_unique<ngu::Vulkan>(
+                model, vi->width, vi->height, core, api, vi->format.bitsPerSample);
+        } else {
+            cpu_model.emplace(std::move(model));
+        }
         auto data = std::make_unique<Filter>(Filter{
-            std::move(input), *vi, output_info, std::move(model), nullptr});
-        if (use_vulkan)
-            data->vulkan = std::make_unique<ngu::Vulkan>(
-                data->model, vi->width, vi->height, core, api, vi->format.bitsPerSample);
+            std::move(input), *vi, output_info, std::move(model_id),
+            compute_prec, weight_prec, backend_str, std::move(cpu_model), std::move(vulkan_engine)});
         const VSFilterDependency dependency{data->input.get(), rpStrictSpatial};
         VSNode *node = api->createVideoFilterEx2("NGU2x", &data->output_info, get_frame, free_filter,
             fmParallel, use_vulkan ? ffGPUOutput : 0, &dependency, 1, data.get(), core);

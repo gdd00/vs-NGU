@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <array>
-#include <condition_variable>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -36,7 +35,7 @@ layout(local_size_x=8, local_size_y=8, local_size_z=1) in;
 layout(set=0, binding=0, std430) readonly buffer Source { float s[]; };
 layout(set=0, binding=1, std430) writeonly buffer Destination { float d[]; };
 layout(set=0, binding=2, std430) readonly buffer Parameters { float p[]; };
-float parameter_at(uint i) { return p[i]; }
+float parameter_at(uint i) { return p[i]; };
 layout(set=0, binding=3, std430) readonly buffer Auxiliary { float a[]; };
 layout(push_constant, std430) uniform Push {
     uint op, width, height, ci, co, src_stride, dst_stride, aux_stride;
@@ -96,12 +95,10 @@ void main() {
                 }
         for (uint c=0; c<4; ++c) d[out_index+x*4+c]=sum[c];
     } else if (pc.op==4) {
-        // Source is the packed (w+2,h+2,4) residual, auxiliary is baseline Y.
         uint lane=3-(x&1)-2*(y&1);
         precise float v=a[y*pc.aux_stride+x]+s[((y+1)/2)*pc.src_stride+((x+1)/2)*4+lane];
         d[out_index+x]=v;
     } else {
-        // Source is the original pitched plane; auxiliary is the AA XYZ head.
         uint ix=x/2, iy=y/2;
         precise float v=sample_at(int(ix),int(iy),0);
         uint hi=iy*pc.aux_stride+ix*4;
@@ -128,6 +125,11 @@ constexpr char shader_preamble[] = R"glsl(#version 460
 // SPIR-V float controls: SignedZeroInfNanPreserve and RoundingModeRTE (FP32).
 spirv_execution_mode(capabilities=[4466], 4461, 32);
 spirv_execution_mode(capabilities=[4467], 4462, 32);
+#define NGU_UBO_DECL(n4, n8) layout(set=0, binding=2, std140) uniform Params { vec4 ubo[n4]; };
+#define NGU_P0(i2) ubo[(i2) * 2u]
+#define NGU_P1(i2) ubo[(i2) * 2u + 1u]
+#define NGU_LOAD_PAIR(i2, uvar, wa, wb) vec4 wa = ubo[(i2) * 2u], wb = ubo[(i2) * 2u + 1u]
+#define NGU_MAC(acc, sv, wv) acc += (sv) * (wv)
 )glsl";
 
 void vk_check(VkResult result, const char *operation) {
@@ -160,7 +162,6 @@ struct Exec {
     }
     void submit(std::uint64_t *signaled = nullptr) {
         char error[1024]{};
-        // submit consumes the recording on BOTH success and failure.
         if (api->gpuExecSubmit(std::exchange(context, nullptr), signaled, error, sizeof(error)))
             throw std::runtime_error(std::string("GPU submit: ") + error);
     }
@@ -190,52 +191,75 @@ struct FastPass {
     int dst_slice = -2; // -2 = output frame, >=0 = workspace slice index
 };
 
+void align_uvec4_floats(std::vector<float> &dst) {
+    if (dst.size() % 8 != 0)
+        dst.resize(dst.size() + (8 - (dst.size() % 8)), 0.0f);
+}
+
 void append_floats(std::vector<float> &dst, std::span<const float> src) {
     dst.insert(dst.end(), src.begin(), src.end());
 }
 
-std::vector<float> pack_1toC(const Layer &layer) {
+std::uint32_t pack_1toC_aligned(std::vector<float> &dst, const Layer &layer) {
+    align_uvec4_floats(dst);
+    const auto u_off = static_cast<std::uint32_t>(dst.size() / 8);
     const int co = layer.output_channels();
-    std::vector<float> out(static_cast<std::size_t>(9) * co, 0.0f);
+    const int g_out = (co + 3) / 4;
+    const int padded_floats_per_tap = ((g_out + 1) & ~1) * 4;
     for (int ky = 0; ky < 3; ++ky)
-        for (int kx = 0; kx < 3; ++kx)
+        for (int kx = 0; kx < 3; ++kx) {
             for (int o = 0; o < co; ++o)
-                out[(ky * 3 + kx) * co + o] = layer.weight_at(o * 9 + ky * 3 + kx);
-    return out;
+                dst.push_back(layer.weight_at(o * 9 + ky * 3 + kx));
+            for (int p = co; p < padded_floats_per_tap; ++p)
+                dst.push_back(0.0f);
+        }
+    return u_off;
 }
 
-std::vector<float> pack_nc4(const Layer &layer) {
+std::uint32_t pack_nc4_ordered(std::vector<float> &dst, const Layer &layer, bool col_order) {
+    align_uvec4_floats(dst);
+    const auto u_off = static_cast<std::uint32_t>(dst.size() / 8);
     const int ci = layer.input_channels();
     const int co = layer.output_channels();
     const int igs = (ci + 3) / 4;
     const int ogs = (co + 3) / 4;
-    std::vector<float> out(static_cast<std::size_t>(9) * igs * 4 * ogs * 4, 0.0f);
-    for (int ky = 0; ky < 3; ++ky)
+    const int co_padded = ogs * 4;
+    auto emit_tap = [&](int ky, int kx, int ig) {
+        for (int c = 0; c < 4; ++c) {
+            const int ic = ig * 4 + c;
+            for (int o = 0; o < co_padded; ++o) {
+                const float w = (ic < ci && o < co)
+                    ? layer.weight_at(((o * ci + ic) * 3 + ky) * 3 + kx)
+                    : 0.0f;
+                dst.push_back(w);
+            }
+        }
+    };
+    if (col_order) {
         for (int kx = 0; kx < 3; ++kx)
-            for (int c = 0; c < ci; ++c)
-                for (int o = 0; o < co; ++o)
-                    out[(((ky * 3 + kx) * igs + (c >> 2)) * 4 + (c & 3)) * ogs * 4 + (o >> 2) * 4 +
-                        (o & 3)] = layer.weight_at(((o * ci + c) * 3 + ky) * 3 + kx);
-    return out;
+            for (int ig = 0; ig < igs; ++ig)
+                for (int ky = 0; ky < 3; ++ky)
+                    emit_tap(ky, kx, ig);
+    } else {
+        for (int ky = 0; ky < 3; ++ky)
+            for (int kx = 0; kx < 3; ++kx)
+                for (int ig = 0; ig < igs; ++ig)
+                    emit_tap(ky, kx, ig);
+    }
+    align_uvec4_floats(dst);
+    return u_off;
 }
 
-std::vector<float> pack_aa_head_3x3(const Layer &head) {
-    const int ci = head.input_channels();
-    const int igs = (ci + 3) / 4;
-    std::vector<float> out(static_cast<std::size_t>(9) * igs * 16, 0.0f);
-    for (int ky = 0; ky < 3; ++ky)
-        for (int kx = 0; kx < 3; ++kx)
-            for (int ic = 0; ic < ci; ++ic)
-                for (int oc = 0; oc < 4; ++oc)
-                    out[((ky * 3 + kx) * igs * 4 + (ic >> 2) * 4 + (ic & 3)) * 4 + oc] =
-                        head.weight_at(((oc * ci + ic) * 3 + ky) * 3 + kx);
-    return out;
+std::uint32_t pack_aa_head_ordered(std::vector<float> &dst, const Layer &head, bool col_order) {
+    return pack_nc4_ordered(dst, head, col_order);
 }
 
-std::vector<float> pack_k4_head_3x3(const Layer &head) {
+std::uint32_t pack_k4_head_ordered(std::vector<float> &dst, const Layer &head, bool col_order) {
+    align_uvec4_floats(dst);
+    const auto u_off = static_cast<std::uint32_t>(dst.size() / 8);
     const int ci = head.input_channels();
     const int igs = (ci + 3) / 4;
-    std::vector<float> out(static_cast<std::size_t>(9) * igs * 16, 0.0f);
+    std::vector<float> spatial(static_cast<std::size_t>(9) * igs * 16, 0.0f);
     for (int sub = 0; sub < 4; ++sub) {
         const int sx = sub & 1, sy = sub >> 1;
         const int lane = 3 - sx - 2 * sy;
@@ -244,11 +268,42 @@ std::vector<float> pack_k4_head_3x3(const Layer &head) {
                 const int kx = (sx - dx) + 1;
                 const int ky = (sy - dy) + 1;
                 for (int ic = 0; ic < ci; ++ic)
-                    out[((ky * 3 + kx) * igs * 16) + (ic >> 2) * 16 + (ic & 3) * 4 + sub] =
+                    spatial[((ky * 3 + kx) * igs * 16) + (ic >> 2) * 16 + (ic & 3) * 4 + sub] =
                         head.weight_at(ic * 16 + (lane / 2 + dy * 2) * 4 + lane % 2 + dx * 2);
             }
     }
-    return out;
+    auto emit_tap = [&](int ky, int kx, int ig) {
+        const std::size_t base = (static_cast<std::size_t>(ky * 3 + kx) * igs + ig) * 16;
+        dst.insert(dst.end(), spatial.begin() + base, spatial.begin() + base + 16);
+    };
+    if (col_order) {
+        for (int kx = 0; kx < 3; ++kx)
+            for (int ig = 0; ig < igs; ++ig)
+                for (int ky = 0; ky < 3; ++ky)
+                    emit_tap(ky, kx, ig);
+    } else {
+        dst.insert(dst.end(), spatial.begin(), spatial.end());
+    }
+    align_uvec4_floats(dst);
+    return u_off;
+}
+
+std::uint32_t pack_bias_aligned(std::vector<float> &dst, const Layer &layer) {
+    align_uvec4_floats(dst);
+    const auto u_off = static_cast<std::uint32_t>(dst.size() / 8);
+    for (int i = 0; i < layer.output_channels(); ++i)
+        dst.push_back(layer.bias_at(i));
+    align_uvec4_floats(dst);
+    return u_off;
+}
+
+std::uint32_t pack_k4_bias_aligned(std::vector<float> &dst, const Layer &head) {
+    align_uvec4_floats(dst);
+    const auto u_off = static_cast<std::uint32_t>(dst.size() / 8);
+    const float bh = head.bias_at(0);
+    dst.insert(dst.end(), 4, bh);
+    align_uvec4_floats(dst);
+    return u_off;
 }
 
 std::vector<float> pack_bias(const Layer &layer) {
@@ -258,760 +313,1455 @@ std::vector<float> pack_bias(const Layer &layer) {
     return out;
 }
 
-// One generator context per filter construction. FP16 uses explicit half FMA
-// updates; FP32 retains its original contraction and traversal strategy.
+struct StageDesc {
+    int c_in;
+    int c_out;
+    bool col_order;
+    bool is_head;
+    std::uint32_t w_uoff;
+    std::uint32_t b_uoff;
+};
+
 struct ShaderGenerator {
     bool half;
 
-std::string emit_nc4_loop_1px(const char *wname, const char *tile_name, int igs, int ogs,
-                              const std::string &ry_expr, const std::string &rx_expr, bool clamp_coords) const {
-    std::string r = "    uint wi = 0u;\n    for (int ky = 0; ky < 3; ++ky) {\n";
-    if (clamp_coords)
-        r += "        uint ry = " + ry_expr + ";\n";
-    r += "        for (int kx = 0; kx < 3; ++kx) {\n";
-    if (clamp_coords)
-        r += "            uint rx = " + rx_expr + ";\n";
-    const std::string y_s = clamp_coords ? "ry" : ry_expr;
-    const std::string x_s = clamp_coords ? "rx" : rx_expr;
-    r += "            for (uint ig = 0u; ig < " + std::to_string(igs) + "u; ++ig) {\n";
-    r += "                vec4 v = " + std::string(tile_name) + "[ig][" + y_s + "][" + x_s + "];\n";
-    const char *comps[4] = {"x", "y", "z", "w"};
-    for (int og = 0; og < ogs; ++og) {
-        for (int c = 0; c < 4; ++c) {
-            if (c == 0 || half)
-                r += "                o" + std::to_string(og) + " += ";
-            else
-                r += " + ";
-            r += std::string("v.") + comps[c] + "*" + std::string(wname) +
-                 "[wi+" + std::to_string(c * ogs + og) + "u]";
-            if (half || c == 3)
-                r += ";\n";
-        }
-    }
-    r += "                wi += " + std::to_string(4 * ogs) + "u;\n";
-    r += "            }\n        }\n    }\n";
-    return r;
-}
-
-std::string emit_head_compute_and_store(int C, bool aa, const std::string &src_tile_name, int ox_shift,
-                                        int oy_shift, bool clamp_tile) const {
-    const int G = C / 4;
-    std::string r = "    vec4 hsum = bh[0]; uint wi = 0u;\n";
-    r += "    for (int ky = 0; ky < 3; ++ky) {\n";
-    if (clamp_tile)
-        r += "        uint ry = uint(clamp(int(ty) + ky, yl_h, yh_h));\n";
-    r += "        for (int kx = 0; kx < 3; ++kx) {\n";
-    if (clamp_tile)
-        r += "            uint rx = uint(clamp(int(tx) + kx, xl_h, xh_h));\n";
-    const std::string ry_s = clamp_tile ? "ry" : "ty + uint(ky)";
-    const std::string rx_s = clamp_tile ? "rx" : "tx + uint(kx)";
-    r += "            for (uint ig = 0u; ig < " + std::to_string(G) + "u; ++ig) {\n"
-         "                vec4 v = tile[ig][" + ry_s + "][" + rx_s + "];\n"
-         "                hsum += v.x*wh[wi+0u] + v.y*wh[wi+1u] + v.z*wh[wi+2u] + v.w*wh[wi+3u]; wi += 4u;\n"
-         "            }\n        }\n    }\n    uint ox = x * 2u, oy = y * 2u;\n";
-    if (aa) {
-        const std::string sx0 = "tx + " + std::to_string(ox_shift) + "u";
-        const std::string sx1 = "tx + " + std::to_string(ox_shift + 1) + "u";
-        const std::string sy0 = "ty + " + std::to_string(oy_shift) + "u";
-        const std::string sy1 = "ty + " + std::to_string(oy_shift + 1) + "u";
-        r += "    NGU_RAW u00 = " + src_tile_name + "[" + sy0 + "][" + sx0 + "];\n"
-             "    float s00 = NGU_FROM_RAW(u00);\n"
-             "    float s10 = NGU_FROM_RAW(" + src_tile_name + "[" + sy0 + "][" + sx1 + "]);\n"
-             "    float s01 = NGU_FROM_RAW(" + src_tile_name + "[" + sy1 + "][" + sx0 + "]);\n"
-             "    float s11 = NGU_FROM_RAW(" + src_tile_name + "[" + sy1 + "][" + sx1 + "]);\n"
-             "    precise float v10 = (s00 + s10) * 0.5 + hsum.y;\n"
-             "    precise float v01 = (s00 + s01) * 0.5 + hsum.x;\n"
-             "    precise float v11 = (((s00 + s10) + s01) + s11) * 0.25 + hsum.z;\n"
-             "    d[(oy + 0u) * pc.dst_s + ox + 0u] = u00;\n"
-             "    d[(oy + 0u) * pc.dst_s + ox + 1u] = NGU_TO_RAW(v10);\n"
-             "    d[(oy + 1u) * pc.dst_s + ox + 0u] = NGU_TO_RAW(v01);\n"
-             "    d[(oy + 1u) * pc.dst_s + ox + 1u] = NGU_TO_RAW(v11);\n";
-    } else {
-        r += "    float ca = uintBitsToFloat(0x3f5f3333u), cb = uintBitsToFloat(0x3e766666u);\n"
-             "    float cc = uintBitsToFloat(0xbdaccccdu), cd = uintBitsToFloat(0xbce66666u);\n"
-             "    uint c0 = tx * 2u;\n"
-             "    float r0a=bx_t[ty+0u][c0+0u], r1a=bx_t[ty+1u][c0+0u], r2a=bx_t[ty+2u][c0+0u], r3a=bx_t[ty+3u][c0+0u], r4a=bx_t[ty+4u][c0+0u];\n"
-             "    float r0b=bx_t[ty+0u][c0+1u], r1b=bx_t[ty+1u][c0+1u], r2b=bx_t[ty+2u][c0+1u], r3b=bx_t[ty+3u][c0+1u], r4b=bx_t[ty+4u][c0+1u];\n"
-             "    precise float p00 = ((((cd*r0a)+(cb*r1a))+(ca*r2a))+(cc*r3a)) + hsum.x;\n"
-             "    precise float p10 = ((((cd*r0b)+(cb*r1b))+(ca*r2b))+(cc*r3b)) + hsum.y;\n"
-             "    precise float p01 = ((((cc*r1a)+(ca*r2a))+(cb*r3a))+(cd*r4a)) + hsum.z;\n"
-             "    precise float p11 = ((((cc*r1b)+(ca*r2b))+(cb*r3b))+(cd*r4b)) + hsum.w;\n"
-             "    d[(oy + 0u) * pc.dst_s + ox + 0u] = p00;\n"
-             "    d[(oy + 0u) * pc.dst_s + ox + 1u] = p10;\n"
-             "    d[(oy + 1u) * pc.dst_s + ox + 0u] = p01;\n"
-             "    d[(oy + 1u) * pc.dst_s + ox + 1u] = p11;\n";
-    }
-    if (half)
-        replace_shader_text(r,
-            "hsum += v.x*wh[wi+0u] + v.y*wh[wi+1u] + v.z*wh[wi+2u] + v.w*wh[wi+3u];",
-            "hsum += v.x*wh[wi+0u]; hsum += v.y*wh[wi+1u]; "
-            "hsum += v.z*wh[wi+2u]; hsum += v.w*wh[wi+3u];");
-    return r;
-}
-
-// Low quality 1-pass fused 14x14 kernel (1->8, 8->8, 8->8, 8->head), 0 B workspace.
-std::string gen_low_fused(bool aa) const {
-    std::string s = shader_preamble;
-    s += "layout(local_size_x=16, local_size_y=16, local_size_z=1) in;\n";
-    s += aa ? "layout(set=0, binding=0, std430) readonly buffer Source { NGU_RAW s[]; };\n"
-              "layout(set=0, binding=1, std430) writeonly buffer Dest { NGU_RAW d[]; };\n"
-            : "layout(set=0, binding=0, std430) readonly buffer Source { float s[]; };\n"
-              "layout(set=0, binding=1, std430) writeonly buffer Dest { float d[]; };\n";
-    s += "layout(set=0, binding=2, std140) uniform Params {\n"
-         "    vec4 w0[18]; vec4 b0[2]; vec4 w1[144]; vec4 b1[2];\n"
-         "    vec4 w2[144]; vec4 b2[2]; vec4 wh[72]; vec4 bh[1];\n};\n"
-         "layout(set=0, binding=3, std430) readonly buffer Aux { float aux_unused[]; };\n"
-         "layout(push_constant, std430) uniform Push { uint width, height, plane_stride, src_s, dst_s, dst_w, dst_h; } pc;\n";
-    s += aa ? "shared NGU_RAW src_t[22][22];\n" : "shared float src_t[22][22];\n";
-    s += "shared vec4 tile[2][20][20];\n";
-    if (!aa)
-        s += "shared float bx_t[18][28];\n";
-    s += "void main() {\n"
-         "    uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y, tid = ty * 16u + tx;\n"
-         "    int bx = int(gl_WorkGroupID.x) * 14, by = int(gl_WorkGroupID.y) * 14;\n"
-         "    for (uint idx = tid; idx < 484u; idx += 256u) {\n"
-         "        uint ly = idx / 22u; uint lx = idx - ly * 22u;\n"
-         "        uint gx = uint(clamp(bx + int(lx) - 4, 0, int(pc.width) - 1));\n"
-         "        uint gy = uint(clamp(by + int(ly) - 4, 0, int(pc.height) - 1));\n"
-         "        src_t[ly][lx] = s[gy * pc.src_s + gx];\n"
-         "    }\n    barrier();\n";
-    if (!aa) {
-        s += "    if (tid < 252u) {\n"
-             "        float ca = uintBitsToFloat(0x3f5f3333u), cb = uintBitsToFloat(0x3e766666u);\n"
-             "        float cc = uintBitsToFloat(0xbdaccccdu), cd = uintBitsToFloat(0xbce66666u);\n"
-             "        uint r = tid / 14u; uint lx = tid - r * 14u;\n"
-             "        float s0=src_t[r+2u][lx+2u], s1=src_t[r+2u][lx+3u], s2=src_t[r+2u][lx+4u], s3=src_t[r+2u][lx+5u], s4=src_t[r+2u][lx+6u];\n"
-             "        bx_t[r][lx*2u+0u] = (((cd*s0)+(cb*s1))+(ca*s2))+(cc*s3);\n"
-             "        bx_t[r][lx*2u+1u] = (((cc*s1)+(ca*s2))+(cb*s3))+(cd*s4);\n"
-             "    }\n";
-    }
-    const std::string src_read = aa ? "NGU_FROM_RAW(src_t" : "src_t";
-    const std::string src_end = aa ? ")" : "";
-    auto emit_b0_px = [&](const char *py, const char *px, const char *sfx) {
-        return "        vec4 o0=b0[0], o1=b0[1]; uint wi=0u;\n"
-               "        for (int ky=0; ky<3; ++ky) for (int kx=0; kx<3; ++kx) {\n"
-               "            float v = " + src_read + "[" + py + "+uint(ky)][" + px + "+uint(kx)]" + src_end + ";\n"
-               "            o0+=v*w0[wi+0u]; o1+=v*w0[wi+1u]; wi+=2u;\n"
-               "        }\n"
-               "        o0_" + std::string(sfx) + "=mix(o0,o0*0.1,lessThan(o0,vec4(0.0)));\n"
-               "        o1_" + std::string(sfx) + "=mix(o1,o1*0.1,lessThan(o1,vec4(0.0)));\n";
-    };
-    s += "    {\n        uint py0 = tid / 20u, px0 = tid - py0 * 20u;\n"
-         "        vec4 o0_0, o1_0, o0_1, o1_1;\n        {\n" + emit_b0_px("py0", "px0", "0") +
-         "        }\n        uint py1 = (tid + 256u) / 20u, px1 = (tid + 256u) - py1 * 20u;\n"
-         "        if (tid + 256u < 400u) {\n" + emit_b0_px("py1", "px1", "1") +
-         "        }\n        barrier();\n"
-         "        tile[0][py0][px0]=o0_0; tile[1][py0][px0]=o1_0;\n"
-         "        if (tid+256u<400u) { tile[0][py1][px1]=o0_1; tile[1][py1][px1]=o1_1; }\n"
-         "        barrier();\n    }\n";
-    // b1: 18x18 (M_out=2, reads M_in=3)
-    s += "    {\n        int xl_19=max(0,3-bx), yl_19=max(0,3-by), xh_19=min(19,int(pc.width)+2-bx), yh_19=min(19,int(pc.height)+2-by);\n"
-         "        uint py0 = tid / 18u, px0 = tid - py0 * 18u;\n"
-         "        vec4 o0_0, o1_0, o0_1, o1_1;\n        {\n"
-         "            vec4 o0=b1[0], o1=b1[1];\n" +
-         emit_nc4_loop_1px("w1", "tile", 2, 2, "uint(clamp(int(py0)+ky,yl_19,yh_19))",
-                           "uint(clamp(int(px0)+kx,xl_19,xh_19))", true) +
-         "            o0_0=mix(o0,o0*0.1,lessThan(o0,vec4(0.0))); o1_0=mix(o1,o1*0.1,lessThan(o1,vec4(0.0)));\n"
-         "        }\n        uint py1 = (tid + 256u) / 18u, px1 = (tid + 256u) - py1 * 18u;\n"
-         "        if (tid + 256u < 324u) {\n"
-         "            vec4 o0=b1[0], o1=b1[1];\n" +
-         emit_nc4_loop_1px("w1", "tile", 2, 2, "uint(clamp(int(py1)+ky,yl_19,yh_19))",
-                           "uint(clamp(int(px1)+kx,xl_19,xh_19))", true) +
-         "            o0_1=mix(o0,o0*0.1,lessThan(o0,vec4(0.0))); o1_1=mix(o1,o1*0.1,lessThan(o1,vec4(0.0)));\n"
-         "        }\n        barrier();\n"
-         "        tile[0][py0][px0]=o0_0; tile[1][py0][px0]=o1_0;\n"
-         "        if (tid+256u<324u) { tile[0][py1][px1]=o0_1; tile[1][py1][px1]=o1_1; }\n"
-         "        barrier();\n    }\n";
-    // b2: 16x16 (M_out=1, reads M_in=2)
-    s += "    {\n        int xl_17=max(0,2-bx), yl_17=max(0,2-by), xh_17=min(17,int(pc.width)+1-bx), yh_17=min(17,int(pc.height)+1-by);\n"
-         "        vec4 o0=b2[0], o1=b2[1];\n" +
-         emit_nc4_loop_1px("w2", "tile", 2, 2, "uint(clamp(int(ty)+ky,yl_17,yh_17))",
-                           "uint(clamp(int(tx)+kx,xl_17,xh_17))", true) +
-         "        barrier();\n"
-         "        tile[0][ty][tx]=mix(o0,o0*0.1,lessThan(o0,vec4(0.0)));\n"
-         "        tile[1][ty][tx]=mix(o1,o1*0.1,lessThan(o1,vec4(0.0)));\n"
-         "        barrier();\n    }\n";
-    // Head: 14x14 (M_out=0, reads M_in=1)
-    s += "    if (tx >= 14u || ty >= 14u) return;\n"
-         "    uint x = uint(bx) + tx, y = uint(by) + ty;\n"
-         "    if (x >= pc.width || y >= pc.height) return;\n"
-         "    int xl_h=max(0,1-bx), yl_h=max(0,1-by), xh_h=min(15,int(pc.width)-bx), yh_h=min(15,int(pc.height)-by);\n" +
-         emit_head_compute_and_store(8, aa, "src_t", 4, 4, true) +
-         "}\n";
-    return s;
-}
-
-// Coalesced halo loader for 32x12 (local_size=(32,4)) tiles; g_count=0 loads scalar plane, >=1 loads vec4 groups.
-std::string emit_32x12_halo_load(const char *dst_arr, const char *src_buf, const char *row_stride,
-                                 int g_count, int pad, int extra_x, int rows) const {
-    std::string r =
-        "    { uint gx = uint(clamp(bx + int(tx) - " + std::to_string(pad) + ", 0, int(pc.width) - 1));\n"
-        "      uint gx_r = uint(clamp(bx + 32 + int(tx) - " + std::to_string(pad) + ", 0, int(pc.width) - 1));\n"
-        "      for (uint sy = ty; sy < " + std::to_string(rows) + "u; sy += 4u) {\n"
-        "          uint row = uint(clamp(by + int(sy) - " + std::to_string(pad) + ", 0, int(pc.height) - 1)) * " +
-        std::string(row_stride) + ";\n";
-    if (g_count == 0) {
-        r += "          " + std::string(dst_arr) + "[sy][tx] = " + std::string(src_buf) + "[row + gx];\n"
-             "          if (tx < " + std::to_string(extra_x) + "u) " + std::string(dst_arr) +
-             "[sy][32u + tx] = " + std::string(src_buf) + "[row + gx_r];\n";
-    } else {
-        r += "          for (int g = 0; g < " + std::to_string(g_count) + "; ++g) {\n"
-             "              uint ps = uint(g) * pc.plane_stride + row;\n"
-             "              " + std::string(dst_arr) + "[g][sy][tx] = " + std::string(src_buf) + "[ps + gx];\n"
-             "              if (tx < " + std::to_string(extra_x) + "u) " + std::string(dst_arr) +
-             "[g][sy][32u + tx] = " + std::string(src_buf) + "[ps + gx_r];\n"
-             "          }\n";
-    }
-    return r + "      }\n    }\n";
-}
-
-// 3-row-per-thread (3py) 3x3 NC4 inner accumulation loop with runtime pc.k3 over kx to control register pressure.
-std::string emit_nc4_3py_loop(const char *wname, const char *tname, const char *acc_prefix, int c_in,
-                              int og0, int og1, int g_out_total, bool du, bool clamp_coords) const {
-    const int igs = c_in / 4;
-    const char *comps[4] = {"x", "y", "z", "w"};
-    std::string r =
-        "        for (uint kx = 0u; kx < pc.k3; ++kx) {\n"
-        "            uint kx_off = kx * " + std::to_string(c_in * g_out_total) + "u;\n";
-    if (clamp_coords)
-        r += "            uint rx = uint(clamp(int(tx + kx), xl, xh));\n";
-    r += "            " + std::string(du ? "[[dont_unroll]] " : "") +
-         "for (uint ig = 0u; ig < " + std::to_string(igs) + "u; ++ig) {\n";
-    for (int row = 0; row < 5; ++row) {
-        const std::string y_idx = clamp_coords ? ("ry" + std::to_string(row)) : ("yl + " + std::to_string(row) + "u");
-        const std::string x_idx = clamp_coords ? "rx" : "tx + kx";
-        r += "                vec4 t" + std::to_string(row) + " = " + std::string(tname) + "[ig][" + y_idx + "][" +
-             x_idx + "];\n";
-    }
-    r += "                uint base = kx_off + ig * " + std::to_string(4 * g_out_total) + "u;\n";
-    for (int ky = 0; ky < 3; ++ky)
-        for (int c = 0; c < 4; ++c)
-            for (int og = og0; og < og1; ++og) {
-                const std::string suffix = (g_out_total == 1) ? "" : ("_" + std::to_string(og));
-                r += "                { vec4 w = " + std::string(wname) + "[base + " +
-                     std::to_string((ky * 3 * c_in + c) * g_out_total + og) + "u]; ";
-                for (int p = 0; p < 3; ++p)
-                    r += std::string(acc_prefix) + std::to_string(p) + suffix + "+=t" + std::to_string(ky + p) + "." +
-                         comps[c] + "*w; ";
-                r += "}\n";
+    static std::string emit_bias_init_n(int g_out, const std::string &b_uoff_expr, const char *pfx,
+                                        int n_px, const char *indent, int uid) {
+        std::string r;
+        for (int og = 0; og < g_out; og += 2) {
+            const std::string i2 = "(" + b_uoff_expr + " + " + std::to_string(og / 2) + "u)";
+            const std::string tag = std::to_string(uid) + "_" + std::to_string(og);
+            if (og + 1 < g_out) {
+                r += std::string(indent) + "NGU_LOAD_PAIR(" + i2 + ", ub_" + tag + ", ba_" + tag + ", bb_" + tag + ");\n";
+                for (int p = 0; p < n_px; ++p) {
+                    r += std::string(indent) + pfx + std::to_string(p) + "_" + std::to_string(og) + " = ba_" + tag + ";\n";
+                    r += std::string(indent) + pfx + std::to_string(p) + "_" + std::to_string(og + 1) + " = bb_" + tag + ";\n";
+                }
+            } else {
+                r += std::string(indent) + "vec4 ba_" + tag + " = NGU_P0(" + i2 + ");\n";
+                const std::string sfx = (g_out == 1) ? "" : ("_" + std::to_string(og));
+                for (int p = 0; p < n_px; ++p)
+                    r += std::string(indent) + pfx + std::to_string(p) + sfx + " = ba_" + tag + ";\n";
             }
-    return r + "            }\n        }\n";
-}
-
-// 32x12 128-thread single-pass 119-quad + 3py 1->c_mid->c_out fused stage.
-std::string gen_in_fused2_3py(int c_mid, int c_out, bool du_l1) const {
-    const int gm = c_mid / 4, go = c_out / 4;
-    std::string s = shader_preamble;
-    s += "layout(local_size_x=32, local_size_y=4, local_size_z=1) in;\n"
-         "layout(set=0, binding=0, std430) readonly buffer Source { float s[]; };\n"
-         "layout(set=0, binding=1, std430) writeonly buffer Dest { vec4 d[]; };\n"
-         "layout(set=0, binding=2, std140) uniform Params { vec4 w0[" + std::to_string(9 * gm) +
-         "]; vec4 b0[" + std::to_string(gm) + "]; vec4 w1[" + std::to_string(9 * c_mid * go) +
-         "]; vec4 b1[" + std::to_string(go) + "]; };\n"
-         "layout(set=0, binding=3, std430) readonly buffer Aux { float aux_unused[]; };\n"
-         "layout(push_constant, std430) uniform Push { uint width, height, plane_stride, src_s, dst_s, dst_w, dst_h, k3; } pc;\n"
-         "shared float src_t[16][36];\n"
-         "shared vec4 tile[" + std::to_string(gm) + "][14][34];\n"
-         "void main() {\n"
-         "    uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y, tid = ty * 32u + tx;\n"
-         "    int bx = int(gl_WorkGroupID.x) * 32, by = int(gl_WorkGroupID.y) * 12;\n" +
-         emit_32x12_halo_load("src_t", "s", "pc.src_s", 0, 2, 4, 16) +
-         "    barrier();\n"
-         "    if (tid < 119u) {\n"
-         "        uint qy = tid / 17u, qx = tid - qy * 17u, py0 = qy * 2u, px0 = qx * 2u;\n";
-    for (int og = 0; og < gm; ++og)
-        s += "        vec4 q00_" + std::to_string(og) + "=b0[" + std::to_string(og) + "], q01_" +
-             std::to_string(og) + "=q00_" + std::to_string(og) + ", q10_" + std::to_string(og) + "=q00_" +
-             std::to_string(og) + ", q11_" + std::to_string(og) + "=q00_" + std::to_string(og) + ";\n";
-    for (int ky = 0; ky < 3; ++ky) {
-        s += "        {\n"
-             "            float a0=src_t[py0+" + std::to_string(ky) + "u][px0+0u], a1=src_t[py0+" +
-             std::to_string(ky) + "u][px0+1u], a2=src_t[py0+" + std::to_string(ky) +
-             "u][px0+2u], a3=src_t[py0+" + std::to_string(ky) + "u][px0+3u];\n"
-             "            float b0s=src_t[py0+" + std::to_string(ky + 1) + "u][px0+0u], b1s=src_t[py0+" +
-             std::to_string(ky + 1) + "u][px0+1u], b2s=src_t[py0+" + std::to_string(ky + 1) +
-             "u][px0+2u], b3s=src_t[py0+" + std::to_string(ky + 1) + "u][px0+3u];\n";
-        for (int kx = 0; kx < 3; ++kx)
-            for (int og = 0; og < gm; ++og)
-                s += "            { vec4 w=w0[" + std::to_string((ky * 3 + kx) * gm + og) + "u]; q00_" +
-                     std::to_string(og) + "+=a" + std::to_string(kx) + "*w; q01_" + std::to_string(og) +
-                     "+=a" + std::to_string(kx + 1) + "*w; q10_" + std::to_string(og) + "+=b" +
-                     std::to_string(kx) + "s*w; q11_" + std::to_string(og) + "+=b" +
-                     std::to_string(kx + 1) + "s*w; }\n";
-        s += "        }\n";
-    }
-    for (int og = 0; og < gm; ++og)
-        for (int py = 0; py < 2; ++py)
-            for (int px = 0; px < 2; ++px) {
-                const std::string qn = "q" + std::to_string(py) + std::to_string(px) + "_" + std::to_string(og);
-                s += "        tile[" + std::to_string(og) + "][py0+" + std::to_string(py) + "u][px0+" +
-                     std::to_string(px) + "u]=mix(" + qn + "," + qn + "*0.1,lessThan(" + qn + ",vec4(0.0)));\n";
-            }
-    s += "    }\n    barrier();\n"
-         "    uint x = uint(bx) + tx, y0 = uint(by) + ty * 3u;\n"
-         "    if (x >= pc.width || y0 >= pc.height) return;\n"
-         "    int xl = max(0, 1 - bx), yl_b = max(0, 1 - by), xh = min(33, int(pc.width) - bx), yh_b = min(13, int(pc.height) - by);\n";
-    for (int r = 0; r < 5; ++r)
-        s += "    uint ry" + std::to_string(r) + " = uint(clamp(int(ty * 3u) + " + std::to_string(r) + ", yl_b, yh_b));\n";
-    s += "    {\n";
-    for (int p = 0; p < 3; ++p)
-        for (int og = 0; og < go; ++og)
-            s += "        vec4 p" + std::to_string(p) + "_" + std::to_string(og) + " = b1[" + std::to_string(og) + "];\n";
-    s += emit_nc4_3py_loop("w1", "tile", "p", c_mid, 0, go, go, du_l1, true);
-    for (int p = 0; p < 3; ++p) {
-        if (p > 0)
-            s += "        if (y0 + " + std::to_string(p) + "u < pc.height) {\n";
-        s += "        uint ob = (y0 + " + std::to_string(p) + "u) * pc.width + x;\n";
-        for (int og = 0; og < go; ++og) {
-            const std::string pn = "p" + std::to_string(p) + "_" + std::to_string(og);
-            s += "        d[" + std::to_string(og) + "u * pc.plane_stride + ob] = mix(" + pn + ", " + pn +
-                 "*0.1, lessThan(" + pn + ", vec4(0.0)));\n";
         }
-        if (p > 0)
-            s += "        }\n";
+        return r;
     }
-    return s + "    }\n}\n";
-}
 
-// 16x16 C->C->C 2-layer fused stage (optimal for C=8 medium Pass 2).
-std::string gen_fused2_16x16(int C) const {
-    const int G = C / 4;
-    const int W4 = 9 * C * G;
-    std::string s = shader_preamble;
-    s += "layout(local_size_x=16, local_size_y=16, local_size_z=1) in;\n"
-         "layout(set=0, binding=0, std430) readonly buffer Source { vec4 s[]; };\n"
-         "layout(set=0, binding=1, std430) writeonly buffer Dest { vec4 d[]; };\n"
-         "layout(set=0, binding=2, std140) uniform Params { vec4 w0[" + std::to_string(W4) + "]; vec4 b0[" +
-         std::to_string(G) + "]; vec4 w1[" + std::to_string(W4) + "]; vec4 b1[" + std::to_string(G) + "]; };\n"
-         "layout(set=0, binding=3, std430) readonly buffer Aux { float aux_unused[]; };\n"
-         "layout(push_constant, std430) uniform Push { uint width, height, plane_stride, src_s, dst_s, dst_w, dst_h; } pc;\n"
-         "shared vec4 tile[" + std::to_string(G) + "][20][20];\n"
-         "void main() {\n"
-         "    uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y, tid = ty * 16u + tx;\n"
-         "    int bx = int(gl_WorkGroupID.x) * 16, by = int(gl_WorkGroupID.y) * 16;\n"
-         "    for (uint idx = tid; idx < " + std::to_string(G * 400) + "u; idx += 256u) {\n"
-         "        uint g = idx / 400u; uint rem = idx - g * 400u;\n"
-         "        uint ly = rem / 20u; uint lx = rem - ly * 20u;\n"
-         "        uint gx = uint(clamp(bx + int(lx) - 2, 0, int(pc.width) - 1));\n"
-         "        uint gy = uint(clamp(by + int(ly) - 2, 0, int(pc.height) - 1));\n"
-         "        tile[g][ly][lx] = s[g * pc.plane_stride + gy * pc.width + gx];\n"
-         "    }\n    barrier();\n";
-    for (int og = 0; og < G; ++og)
-        s += "    vec4 o" + std::to_string(og) + "_a, o" + std::to_string(og) + "_b;\n";
-    s += "    uint py0 = tid / 18u, px0 = tid - py0 * 18u;\n    {\n";
-    for (int og = 0; og < G; ++og)
-        s += "        vec4 o" + std::to_string(og) + " = b0[" + std::to_string(og) + "];\n";
-    s += emit_nc4_loop_1px("w0", "tile", G, G, "py0+uint(ky)", "px0+uint(kx)", false);
-    for (int og = 0; og < G; ++og)
-        s += "        o" + std::to_string(og) + "_a = mix(o" + std::to_string(og) + ", o" +
-             std::to_string(og) + "*0.1, lessThan(o" + std::to_string(og) + ", vec4(0.0)));\n";
-    s += "    }\n    uint py1 = (tid + 256u) / 18u, px1 = (tid + 256u) - py1 * 18u;\n"
-         "    if (tid + 256u < 324u) {\n";
-    for (int og = 0; og < G; ++og)
-        s += "        vec4 o" + std::to_string(og) + " = b0[" + std::to_string(og) + "];\n";
-    s += emit_nc4_loop_1px("w0", "tile", G, G, "py1+uint(ky)", "px1+uint(kx)", false);
-    for (int og = 0; og < G; ++og)
-        s += "        o" + std::to_string(og) + "_b = mix(o" + std::to_string(og) + ", o" +
-             std::to_string(og) + "*0.1, lessThan(o" + std::to_string(og) + ", vec4(0.0)));\n";
-    s += "    }\n    barrier();\n";
-    for (int og = 0; og < G; ++og)
-        s += "    tile[" + std::to_string(og) + "][py0][px0] = o" + std::to_string(og) + "_a;\n";
-    s += "    if (tid + 256u < 324u) {\n";
-    for (int og = 0; og < G; ++og)
-        s += "        tile[" + std::to_string(og) + "][py1][px1] = o" + std::to_string(og) + "_b;\n";
-    s += "    }\n    barrier();\n"
-         "    uint x = uint(bx) + tx, y = uint(by) + ty;\n"
-         "    if (x >= pc.width || y >= pc.height) return;\n"
-         "    int xl = max(0, 1 - bx), yl = max(0, 1 - by), xh = min(17, int(pc.width) - bx), yh = min(17, int(pc.height) - by);\n";
-    for (int og = 0; og < G; ++og)
-        s += "    vec4 o" + std::to_string(og) + " = b1[" + std::to_string(og) + "];\n";
-    s += emit_nc4_loop_1px("w1", "tile", G, G, "uint(clamp(int(ty)+ky,yl,yh))",
-                           "uint(clamp(int(tx)+kx,xl,xh))", true);
-    s += "    uint ob = y * pc.width + x;\n";
-    for (int og = 0; og < G; ++og)
-        s += "    d[" + std::to_string(og) + "u * pc.plane_stride + ob] = mix(o" + std::to_string(og) +
-             ", o" + std::to_string(og) + "*0.1, lessThan(o" + std::to_string(og) + ", vec4(0.0)));\n";
-    s += "}\n";
-    return s;
-}
+    // 1. Low Quality 1-Pass 26x26 (local_size=(16,16)=256 threads, 2x2 quad/thread = 676 src / 2704 4K px/WG!).
+    // Collapses b1 and b2 into a 2-step stg loop so SASS Binary Size stays ~22-28 KB (< 32 KB L1I cache!) in BOTH FP16 & FP32!
+    std::string gen_low_26x26(std::span<const StageDesc> stages, std::uint32_t total_uvec4, bool aa) const {
+        const char *comps[4] = {"x", "y", "z", "w"};
+        std::string s = shader_preamble;
+        s += "layout(local_size_x=16, local_size_y=16, local_size_z=1) in;\n";
+        s += aa ? "layout(set=0, binding=0, std430) readonly buffer Source { NGU_RAW s[]; };\n"
+                  "layout(set=0, binding=1, std430) writeonly buffer Dest4K { NGU_RAW d[]; };\n"
+                : "layout(set=0, binding=0, std430) readonly buffer Source { float s[]; };\n"
+                  "layout(set=0, binding=1, std430) writeonly buffer Dest4K { float d[]; };\n";
+        s += "NGU_UBO_DECL(" + std::to_string(total_uvec4 * 2) + ", " + std::to_string(total_uvec4) + ")\n"
+             "layout(set=0, binding=3, std430) readonly buffer Aux { float aux_unused[]; };\n"
+             "layout(push_constant, std430) uniform Push { uint width, height, plane_stride, src_s, dst_s, dst_w, dst_h, k3; } pc;\n";
+        s += aa ? "shared NGU_RAW src_t[34][36];\n" : "shared float src_t[34][36];\n";
+        s += "shared vec4 tile[2][32][36];\n"
+             "void main() {\n"
+             "    uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y, tid = ty * 16u + tx;\n"
+             "    int bx = int(gl_WorkGroupID.x) * 26, by = int(gl_WorkGroupID.y) * 26;\n"
+             "    for (uint idx = tid; idx < 1156u; idx += 256u) {\n"
+             "        uint ly = idx / 34u, lx = idx - ly * 34u;\n"
+             "        uint gx = uint(clamp(bx + int(lx) - 4, 0, int(pc.width) - 1));\n"
+             "        uint gy = uint(clamp(by + int(ly) - 4, 0, int(pc.height) - 1));\n"
+             "        src_t[ly][lx] = s[gy * pc.src_s + gx];\n"
+             "    }\n"
+             "    barrier();\n"
+             "    uint py0 = ty * 2u, px0 = tx * 2u;\n";
 
-// 32x12 128-thread 3px/thread (3py) 1-layer C->C stage (optimal for high C=12 & very_high C=16).
-// The five loaded rows feed all three outputs. Clamp indices are hoisted and
-// du controls the ig unroll hint for both precisions (FP32 Ada: 128/168 registers).
-std::string gen_1L_3py(int C) const {
-    const int G = C / 4;
-    std::string s = shader_preamble;
-    s += "layout(local_size_x=32, local_size_y=4, local_size_z=1) in;\n"
-         "layout(set=0, binding=0, std430) readonly buffer Source { vec4 s[]; };\n"
-         "layout(set=0, binding=1, std430) writeonly buffer Dest { vec4 d[]; };\n"
-         "layout(set=0, binding=2, std140) uniform Params { vec4 w0[" + std::to_string(9 * C * G) +
-         "]; vec4 b0[" + std::to_string(G) + "]; };\n"
-         "layout(set=0, binding=3, std430) readonly buffer Aux { float aux_unused[]; };\n"
-         "layout(push_constant, std430) uniform Push { uint width, height, plane_stride, src_s, dst_s, dst_w, dst_h, k3; } pc;\n"
-         "shared vec4 tile[" + std::to_string(G) + "][14][34];\n"
-         "void main() {\n"
-         "    uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y;\n"
-         "    int bx = int(gl_WorkGroupID.x) * 32, by = int(gl_WorkGroupID.y) * 12;\n" +
-         emit_32x12_halo_load("tile", "s", "pc.width", G, 1, 2, 14) +
-         "    barrier();\n"
-         "    uint x = uint(bx) + tx, y0 = uint(by) + ty * 3u;\n"
-         "    if (x >= pc.width || y0 >= pc.height) return;\n"
-         "    uint yl = ty * 3u;\n    {\n";
-    for (int p = 0; p < 3; ++p)
-        for (int og = 0; og < G; ++og)
-            s += "        vec4 p" + std::to_string(p) + "_" + std::to_string(og) + " = b0[" + std::to_string(og) + "];\n";
-    s += emit_nc4_3py_loop("w0", "tile", "p", C, 0, G, G, true, false);
-    for (int p = 0; p < 3; ++p) {
-        if (p > 0)
-            s += "        if (y0 + " + std::to_string(p) + "u < pc.height) {\n";
-        s += "        uint ob = (y0 + " + std::to_string(p) + "u) * pc.width + x;\n";
-        for (int og = 0; og < G; ++og) {
-            const std::string pn = "p" + std::to_string(p) + "_" + std::to_string(og);
-            s += "        d[" + std::to_string(og) + "u * pc.plane_stride + ob] = mix(" + pn + ", " + pn +
-                 "*0.1, lessThan(" + pn + ", vec4(0.0)));\n";
-        }
-        if (p > 0)
-            s += "        }\n";
-    }
-    return s + "    }\n}\n";
-}
-
-// 14x14 fused last C->C body layer + head + combine (used for medium Pass 3 & high aa).
-std::string gen_tail_14x14(int C, bool aa) const {
-    const int G = C / 4;
-    const int W4 = 9 * C * G;
-    const int WH = 9 * C;
-    std::string s = shader_preamble;
-    s += "layout(local_size_x=16, local_size_y=16, local_size_z=1) in;\n"
-         "layout(set=0, binding=0, std430) readonly buffer Features { vec4 s[]; };\n";
-    s += aa ? "layout(set=0, binding=1, std430) writeonly buffer Dest4K { NGU_RAW d[]; };\n"
-            : "layout(set=0, binding=1, std430) writeonly buffer Dest4K { float d[]; };\n";
-    s += "layout(set=0, binding=2, std140) uniform Params { vec4 w0[" + std::to_string(W4) + "]; vec4 b0[" +
-         std::to_string(G) + "]; vec4 wh[" + std::to_string(WH) + "]; vec4 bh[1]; };\n";
-    s += aa ? "layout(set=0, binding=3, std430) readonly buffer OrigSrc { NGU_RAW src_in[]; };\n"
-            : "layout(set=0, binding=3, std430) readonly buffer OrigSrc { float src_in[]; };\n";
-    s += "layout(push_constant, std430) uniform Push { uint width, height, plane_stride, src_s, dst_s, dst_w, dst_h; } pc;\n"
-         "shared vec4 tile[" + std::to_string(G) + "][18][18];\n";
-    if (aa)
-        s += "shared NGU_RAW src_u_t[16][16];\n";
-    else
-        s += "shared float src_t[18][18];\nshared float bx_t[18][28];\n";
-    s += "void main() {\n"
-         "    uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y, tid = ty * 16u + tx;\n"
-         "    int bx = int(gl_WorkGroupID.x) * 14, by = int(gl_WorkGroupID.y) * 14;\n"
-         "    for (uint idx = tid; idx < " + std::to_string(G * 324) + "u; idx += 256u) {\n"
-         "        uint g = idx / 324u; uint rem = idx - g * 324u;\n"
-         "        uint ly = rem / 18u; uint lx = rem - ly * 18u;\n"
-         "        uint gx = uint(clamp(bx + int(lx) - 2, 0, int(pc.width) - 1));\n"
-         "        uint gy = uint(clamp(by + int(ly) - 2, 0, int(pc.height) - 1));\n"
-         "        tile[g][ly][lx] = s[g * pc.plane_stride + gy * pc.width + gx];\n"
-         "    }\n";
-    if (aa) {
+        // b0: 1 -> 8 on 32x32 (256/256 threads active = 100% utilization)
+        const std::string rd_pre = aa ? "NGU_FROM_RAW(src_t" : "src_t";
+        const std::string rd_post = aa ? ")" : "";
         s += "    {\n"
-             "        uint gx = uint(clamp(bx + int(tx), 0, int(pc.width) - 1));\n"
-             "        uint gy = uint(clamp(by + int(ty), 0, int(pc.height) - 1));\n"
-             "        src_u_t[ty][tx] = src_in[gy * pc.src_s + gx];\n"
-             "    }\n    barrier();\n";
-    } else {
-        s += "    for (uint idx = tid; idx < 324u; idx += 256u) {\n"
-             "        uint ly = idx / 18u; uint lx = idx - ly * 18u;\n"
-             "        uint gx = uint(clamp(bx + int(lx) - 2, 0, int(pc.width) - 1));\n"
-             "        uint gy = uint(clamp(by + int(ly) - 2, 0, int(pc.height) - 1));\n"
-             "        src_t[ly][lx] = src_in[gy * pc.src_s + gx];\n"
-             "    }\n    barrier();\n"
-             "    if (tid < 252u) {\n"
-             "        float ca = uintBitsToFloat(0x3f5f3333u), cb = uintBitsToFloat(0x3e766666u);\n"
-             "        float cc = uintBitsToFloat(0xbdaccccdu), cd = uintBitsToFloat(0xbce66666u);\n"
-             "        uint r = tid / 14u; uint lx = tid - r * 14u;\n"
-             "        float s0=src_t[r][lx+0u], s1=src_t[r][lx+1u], s2=src_t[r][lx+2u], s3=src_t[r][lx+3u], s4=src_t[r][lx+4u];\n"
-             "        bx_t[r][lx*2u+0u] = (((cd*s0)+(cb*s1))+(ca*s2))+(cc*s3);\n"
-             "        bx_t[r][lx*2u+1u] = (((cc*s1)+(ca*s2))+(cb*s3))+(cd*s4);\n"
-             "    }\n";
-    }
-    s += "    {\n";
-    for (int og = 0; og < G; ++og)
-        s += "        vec4 o" + std::to_string(og) + " = b0[" + std::to_string(og) + "];\n";
-    s += emit_nc4_loop_1px("w0", "tile", G, G, "ty+uint(ky)", "tx+uint(kx)", false);
-    s += "        barrier();\n";
-    for (int og = 0; og < G; ++og)
-        s += "        tile[" + std::to_string(og) + "][ty][tx] = mix(o" + std::to_string(og) + ", o" +
-             std::to_string(og) + "*0.1, lessThan(o" + std::to_string(og) + ", vec4(0.0)));\n";
-    s += "        barrier();\n    }\n"
-         "    if (tx >= 14u || ty >= 14u) return;\n"
-         "    uint x = uint(bx) + tx, y = uint(by) + ty;\n"
-         "    if (x >= pc.width || y >= pc.height) return;\n"
-         "    int xl_h=max(0,1-bx), yl_h=max(0,1-by), xh_h=min(15,int(pc.width)-bx), yh_h=min(15,int(pc.height)-by);\n" +
-         emit_head_compute_and_store(C, aa, "src_u_t", 0, 0, true) +
-         "}\n";
-    return s;
-}
+             "        vec4 q0_0, q0_1, q1_0, q1_1, q2_0, q2_1, q3_0, q3_1;\n" +
+             emit_bias_init_n(2, std::to_string(stages[0].b_uoff) + "u", "q", 4, "        ", 0);
+        for (int ky = 0; ky < 3; ++ky) {
+            s += "        {\n"
+                 "            float a0=" + rd_pre + "[py0+" + std::to_string(ky) + "u][px0+0u]" + rd_post + ", "
+                 "a1=" + rd_pre + "[py0+" + std::to_string(ky) + "u][px0+1u]" + rd_post + ", "
+                 "a2=" + rd_pre + "[py0+" + std::to_string(ky) + "u][px0+2u]" + rd_post + ", "
+                 "a3=" + rd_pre + "[py0+" + std::to_string(ky) + "u][px0+3u]" + rd_post + ";\n"
+                 "            float b0s=" + rd_pre + "[py0+" + std::to_string(ky + 1) + "u][px0+0u]" + rd_post + ", "
+                 "b1s=" + rd_pre + "[py0+" + std::to_string(ky + 1) + "u][px0+1u]" + rd_post + ", "
+                 "b2s=" + rd_pre + "[py0+" + std::to_string(ky + 1) + "u][px0+2u]" + rd_post + ", "
+                 "b3s=" + rd_pre + "[py0+" + std::to_string(ky + 1) + "u][px0+3u]" + rd_post + ";\n";
+            for (int kx = 0; kx < 3; ++kx) {
+                const std::string i2 = std::to_string(stages[0].w_uoff + ky * 3 + kx) + "u";
+                const std::string tag = "b0_" + std::to_string(ky * 3 + kx);
+                s += "            { NGU_LOAD_PAIR(" + i2 + ", uw_" + tag + ", wa_" + tag + ", wb_" + tag + "); "
+                     "NGU_MAC(q0_0, a" + std::to_string(kx) + ", wa_" + tag + "); "
+                     "NGU_MAC(q1_0, a" + std::to_string(kx + 1) + ", wa_" + tag + "); "
+                     "NGU_MAC(q2_0, b" + std::to_string(kx) + "s, wa_" + tag + "); "
+                     "NGU_MAC(q3_0, b" + std::to_string(kx + 1) + "s, wa_" + tag + "); "
+                     "NGU_MAC(q0_1, a" + std::to_string(kx) + ", wb_" + tag + "); "
+                     "NGU_MAC(q1_1, a" + std::to_string(kx + 1) + ", wb_" + tag + "); "
+                     "NGU_MAC(q2_1, b" + std::to_string(kx) + "s, wb_" + tag + "); "
+                     "NGU_MAC(q3_1, b" + std::to_string(kx + 1) + "s, wb_" + tag + "); }\n";
+            }
+            s += "        }\n";
+        }
+        for (int og = 0; og < 2; ++og) {
+            const std::string ogs = std::to_string(og);
+            s += "        tile[" + ogs + "][py0+0u][px0+0u] = mix(q0_" + ogs + ", q0_" + ogs + "*0.1, lessThan(q0_" + ogs + ", vec4(0.0)));\n"
+                 "        tile[" + ogs + "][py0+0u][px0+1u] = mix(q1_" + ogs + ", q1_" + ogs + "*0.1, lessThan(q1_" + ogs + ", vec4(0.0)));\n"
+                 "        tile[" + ogs + "][py0+1u][px0+0u] = mix(q2_" + ogs + ", q2_" + ogs + "*0.1, lessThan(q2_" + ogs + ", vec4(0.0)));\n"
+                 "        tile[" + ogs + "][py0+1u][px0+1u] = mix(q3_" + ogs + ", q3_" + ogs + "*0.1, lessThan(q3_" + ogs + ", vec4(0.0)));\n";
+        }
+        s += "    }\n    barrier();\n";
 
-// 16x16 standalone head + baseline/AA combine (used for high C=12 & very_high C=16).
-std::string gen_head_end(int C, bool aa) const {
-    const int G = C / 4;
-    const int WH = 9 * C;
-    std::string s = shader_preamble;
-    s += "layout(local_size_x=16, local_size_y=16, local_size_z=1) in;\n"
-         "layout(set=0, binding=0, std430) readonly buffer Features { vec4 feat[]; };\n";
-    s += aa ? "layout(set=0, binding=1, std430) writeonly buffer Dest4K { NGU_RAW d[]; };\n"
-            : "layout(set=0, binding=1, std430) writeonly buffer Dest4K { float d[]; };\n";
-    s += "layout(set=0, binding=2, std140) uniform Params { vec4 wh[" + std::to_string(WH) +
-         "]; vec4 bh[1]; };\n";
-    s += aa ? "layout(set=0, binding=3, std430) readonly buffer OrigSrc { NGU_RAW src_in[]; };\n"
-            : "layout(set=0, binding=3, std430) readonly buffer OrigSrc { float src_in[]; };\n";
-    s += "layout(push_constant, std430) uniform Push { uint width, height, plane_stride, src_s, dst_s, dst_w, dst_h; } pc;\n"
-         "shared vec4 tile[" + std::to_string(G) + "][18][18];\n";
-    if (aa)
-        s += "shared NGU_RAW src_u_t[18][18];\n";
-    else
-        s += "shared float src_t[20][20];\nshared float bx_t[20][32];\n";
-    s += "void main() {\n"
-         "    uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y, tid = ty * 16u + tx;\n"
-         "    int bx = int(gl_WorkGroupID.x) * 16, by = int(gl_WorkGroupID.y) * 16;\n"
-         "    for (uint idx = tid; idx < " + std::to_string(G * 324) + "u; idx += 256u) {\n"
-         "        uint g = idx / 324u; uint rem = idx - g * 324u;\n"
-         "        uint ly = rem / 18u; uint lx = rem - ly * 18u;\n"
-         "        uint gx = uint(clamp(bx + int(lx) - 1, 0, int(pc.width) - 1));\n"
-         "        uint gy = uint(clamp(by + int(ly) - 1, 0, int(pc.height) - 1));\n"
-         "        tile[g][ly][lx] = feat[g * pc.plane_stride + gy * pc.width + gx];\n"
-         "    }\n";
-    if (aa) {
-        s += "    for (uint idx = tid; idx < 324u; idx += 256u) {\n"
-             "        uint ly = idx / 18u; uint lx = idx - ly * 18u;\n"
-             "        uint gx = uint(clamp(bx + int(lx) - 1, 0, int(pc.width) - 1));\n"
-             "        uint gy = uint(clamp(by + int(ly) - 1, 0, int(pc.height) - 1));\n"
-             "        src_u_t[ly][lx] = src_in[gy * pc.src_s + gx];\n"
-             "    }\n    barrier();\n";
-    } else {
-        s += "    for (uint idx = tid; idx < 400u; idx += 256u) {\n"
-             "        uint ly = idx / 20u; uint lx = idx - ly * 20u;\n"
-             "        uint gx = uint(clamp(bx + int(lx) - 2, 0, int(pc.width) - 1));\n"
-             "        uint gy = uint(clamp(by + int(ly) - 2, 0, int(pc.height) - 1));\n"
-             "        src_t[ly][lx] = src_in[gy * pc.src_s + gx];\n"
-             "    }\n    barrier();\n"
-             "    {\n"
-             "        float ca = uintBitsToFloat(0x3f5f3333u), cb = uintBitsToFloat(0x3e766666u);\n"
-             "        float cc = uintBitsToFloat(0xbdaccccdu), cd = uintBitsToFloat(0xbce66666u);\n"
-             "        for (uint idx = tid; idx < 320u; idx += 256u) {\n"
-             "            uint r = idx >> 4; uint lx = idx & 15u;\n"
-             "            float s0=src_t[r][lx+0u], s1=src_t[r][lx+1u], s2=src_t[r][lx+2u], s3=src_t[r][lx+3u], s4=src_t[r][lx+4u];\n"
-             "            bx_t[r][lx*2u+0u] = (((cd*s0)+(cb*s1))+(ca*s2))+(cc*s3);\n"
-             "            bx_t[r][lx*2u+1u] = (((cc*s1)+(ca*s2))+(cb*s3))+(cd*s4);\n"
+        // b1 (stg=0: 15x15 quads, pad=3) and b2 (stg=1: 14x14 quads, pad=2) sharing ONE loop body (< 24 KB SASS!)
+        const std::uint32_t w_stride = stages[2].w_uoff - stages[1].w_uoff;
+        const std::uint32_t b_stride = stages[2].b_uoff - stages[1].b_uoff;
+        s += "    [[dont_unroll]] for (uint stg = 0u; stg < 2u; ++stg) {\n"
+             "        uint q_dim = 15u - stg;\n"
+             "        int pad = 3 - int(stg), max_in = 31 - int(stg) * 2;\n"
+             "        vec4 q0_0=vec4(0.0), q0_1=vec4(0.0), q1_0=vec4(0.0), q1_1=vec4(0.0), "
+             "q2_0=vec4(0.0), q2_1=vec4(0.0), q3_0=vec4(0.0), q3_1=vec4(0.0);\n"
+             "        if (tx < q_dim && ty < q_dim) {\n"
+             "            int xl = max(0, pad - bx), xh = min(max_in, int(pc.width) - 1 + pad - bx);\n"
+             "            int ylo = max(0, pad - by), yhi = min(max_in, int(pc.height) - 1 + pad - by);\n" +
+             emit_bias_init_n(2, std::to_string(stages[1].b_uoff) + "u + stg * " + std::to_string(b_stride) + "u",
+                              "q", 4, "            ", 1) +
+             "            uint u_idx = " + std::to_string(stages[1].w_uoff) + "u + stg * " + std::to_string(w_stride) + "u;\n"
+             "            uint rx0=uint(clamp(int(px0)+0,xl,xh)), rx1=uint(clamp(int(px0)+1,xl,xh)), "
+             "rx2=uint(clamp(int(px0)+2,xl,xh)), rx3=uint(clamp(int(px0)+3,xl,xh));\n"
+             "            [[dont_unroll]] for (uint ky = 0u; ky < pc.k3; ++ky) {\n"
+             "                uint ry0 = uint(clamp(int(py0 + ky) + 0, ylo, yhi));\n"
+             "                uint ry1 = uint(clamp(int(py0 + ky) + 1, ylo, yhi));\n"
+             "                vec4 t0_00=tile[0][ry0][rx0], t0_01=tile[0][ry0][rx1], t0_02=tile[0][ry0][rx2], t0_03=tile[0][ry0][rx3];\n"
+             "                vec4 t0_10=tile[0][ry1][rx0], t0_11=tile[0][ry1][rx1], t0_12=tile[0][ry1][rx2], t0_13=tile[0][ry1][rx3];\n"
+             "                vec4 t1_00=tile[1][ry0][rx0], t1_01=tile[1][ry0][rx1], t1_02=tile[1][ry0][rx2], t1_03=tile[1][ry0][rx3];\n"
+             "                vec4 t1_10=tile[1][ry1][rx0], t1_11=tile[1][ry1][rx1], t1_12=tile[1][ry1][rx2], t1_13=tile[1][ry1][rx3];\n";
+        for (int kx = 0; kx < 3; ++kx)
+            for (int ig = 0; ig < 2; ++ig)
+                for (int c = 0; c < 4; ++c) {
+                    const int u_loc = (kx * 2 + ig) * 4 + c;
+                    const std::string tag = "lb_" + std::to_string(u_loc);
+                    const std::string ta0 = "t" + std::to_string(ig) + "_0" + std::to_string(kx);
+                    const std::string tb0 = "t" + std::to_string(ig) + "_0" + std::to_string(kx + 1);
+                    const std::string ta1 = "t" + std::to_string(ig) + "_1" + std::to_string(kx);
+                    const std::string tb1 = "t" + std::to_string(ig) + "_1" + std::to_string(kx + 1);
+                    s += "                { NGU_LOAD_PAIR(u_idx + " + std::to_string(u_loc) + "u, uw_" + tag + ", wa_" + tag + ", wb_" + tag + "); "
+                         "NGU_MAC(q0_0, " + ta0 + "." + comps[c] + ", wa_" + tag + "); "
+                         "NGU_MAC(q1_0, " + tb0 + "." + comps[c] + ", wa_" + tag + "); "
+                         "NGU_MAC(q2_0, " + ta1 + "." + comps[c] + ", wa_" + tag + "); "
+                         "NGU_MAC(q3_0, " + tb1 + "." + comps[c] + ", wa_" + tag + "); "
+                         "NGU_MAC(q0_1, " + ta0 + "." + comps[c] + ", wb_" + tag + "); "
+                         "NGU_MAC(q1_1, " + tb0 + "." + comps[c] + ", wb_" + tag + "); "
+                         "NGU_MAC(q2_1, " + ta1 + "." + comps[c] + ", wb_" + tag + "); "
+                         "NGU_MAC(q3_1, " + tb1 + "." + comps[c] + ", wb_" + tag + "); }\n";
+                }
+        s += "                u_idx += 24u;\n"
+             "            }\n"
              "        }\n"
-             "    }\n    barrier();\n";
-    }
-    s += "    uint x = uint(bx) + tx, y = uint(by) + ty;\n"
-         "    if (x >= pc.width || y >= pc.height) return;\n" +
-         emit_head_compute_and_store(C, aa, "src_u_t", 1, 1, false) +
-         "}\n";
-    return s;
-}
-
-// Emits 3-row (3py) head upsampling combine & global store for 32x12 tiles, preserving FP32 order and AA -0.0.
-std::string emit_3py_head_combine_and_store(bool aa, int src_pad) const {
-    auto off = [](const char *var, int add) {
-        return add == 0 ? std::string(var) : (std::string(var) + "+" + std::to_string(add) + "u");
-    };
-    std::string r = "    uint ox = x * 2u;\n";
-    if (!aa)
-        r += "    float ca = uintBitsToFloat(0x3f5f3333u), cb = uintBitsToFloat(0x3e766666u);\n"
-             "    float cc = uintBitsToFloat(0xbdaccccdu), cd = uintBitsToFloat(0xbce66666u);\n"
-             "    uint c0 = tx * 2u;\n";
-    for (int p = 0; p < 3; ++p) {
-        if (p > 0)
-            r += "    if (y0 + " + std::to_string(p) + "u < pc.height) {\n";
-        r += "    uint ry = ty * 3u + " + std::to_string(p) + "u, oy = (y0 + " + std::to_string(p) + "u) * 2u;\n";
-        const std::string hn = "h" + std::to_string(p);
-        if (aa) {
-            const std::string sy0 = off("ry", src_pad), sy1 = off("ry", src_pad + 1);
-            const std::string sx0 = off("tx", src_pad), sx1 = off("tx", src_pad + 1);
-            r += "    NGU_RAW u00 = src_u_t[" + sy0 + "][" + sx0 + "];\n"
-                 "    float s00 = NGU_FROM_RAW(u00);\n"
-                 "    float s10 = NGU_FROM_RAW(src_u_t[" + sy0 + "][" + sx1 + "]);\n"
-                 "    float s01 = NGU_FROM_RAW(src_u_t[" + sy1 + "][" + sx0 + "]);\n"
-                 "    float s11 = NGU_FROM_RAW(src_u_t[" + sy1 + "][" + sx1 + "]);\n"
-                 "    precise float p10 = (s00 + s10) * 0.5 + " + hn + ".y;\n"
-                 "    precise float p01 = (s00 + s01) * 0.5 + " + hn + ".x;\n"
-                 "    precise float p11 = (((s00 + s10) + s01) + s11) * 0.25 + " + hn + ".z;\n"
-                 "    d[(oy + 0u) * pc.dst_s + ox + 0u] = u00;\n"
-                 "    d[(oy + 0u) * pc.dst_s + ox + 1u] = NGU_TO_RAW(p10);\n"
-                 "    d[(oy + 1u) * pc.dst_s + ox + 0u] = NGU_TO_RAW(p01);\n"
-                 "    d[(oy + 1u) * pc.dst_s + ox + 1u] = NGU_TO_RAW(p11);\n";
-        } else {
-            r += "    float r0a=bx_t[ry+0u][c0], r1a=bx_t[ry+1u][c0], r2a=bx_t[ry+2u][c0], r3a=bx_t[ry+3u][c0], r4a=bx_t[ry+4u][c0];\n"
-                 "    float r0b=bx_t[ry+0u][c0+1u], r1b=bx_t[ry+1u][c0+1u], r2b=bx_t[ry+2u][c0+1u], r3b=bx_t[ry+3u][c0+1u], r4b=bx_t[ry+4u][c0+1u];\n"
-                 "    precise float p00 = ((((cd*r0a)+(cb*r1a))+(ca*r2a))+(cc*r3a)) + " + hn + ".x;\n"
-                 "    precise float p10 = ((((cd*r0b)+(cb*r1b))+(ca*r2b))+(cc*r3b)) + " + hn + ".y;\n"
-                 "    precise float p01 = ((((cc*r1a)+(ca*r2a))+(cb*r3a))+(cd*r4a)) + " + hn + ".z;\n"
-                 "    precise float p11 = ((((cc*r1b)+(ca*r2b))+(cb*r3b))+(cd*r4b)) + " + hn + ".w;\n"
-                 "    d[(oy + 0u) * pc.dst_s + ox + 0u] = p00;\n"
-                 "    d[(oy + 0u) * pc.dst_s + ox + 1u] = p10;\n"
-                 "    d[(oy + 1u) * pc.dst_s + ox + 0u] = p01;\n"
-                 "    d[(oy + 1u) * pc.dst_s + ox + 1u] = p11;\n";
+             "        barrier();\n"
+             "        if (tx < q_dim && ty < q_dim) {\n";
+        for (int og = 0; og < 2; ++og) {
+            const std::string ogs = std::to_string(og);
+            s += "            tile[" + ogs + "][py0+0u][px0+0u] = mix(q0_" + ogs + ", q0_" + ogs + "*0.1, lessThan(q0_" + ogs + ", vec4(0.0)));\n"
+                 "            tile[" + ogs + "][py0+0u][px0+1u] = mix(q1_" + ogs + ", q1_" + ogs + "*0.1, lessThan(q1_" + ogs + ", vec4(0.0)));\n"
+                 "            tile[" + ogs + "][py0+1u][px0+0u] = mix(q2_" + ogs + ", q2_" + ogs + "*0.1, lessThan(q2_" + ogs + ", vec4(0.0)));\n"
+                 "            tile[" + ogs + "][py0+1u][px0+1u] = mix(q3_" + ogs + ", q3_" + ogs + "*0.1, lessThan(q3_" + ogs + ", vec4(0.0)));\n";
         }
-        if (p > 0)
-            r += "    }\n";
-    }
-    return r;
-}
+        s += "        }\n"
+             "        barrier();\n"
+             "    }\n";
 
-// 32x12 128-thread 3py head + AA combine (optimal for very_high aa C=16).
-std::string gen_head_end_3py(int C) const {
-    const int G = C / 4;
-    std::string s = shader_preamble;
-    s += "layout(local_size_x=32, local_size_y=4, local_size_z=1) in;\n"
-         "layout(set=0, binding=0, std430) readonly buffer Features { vec4 feat[]; };\n"
-         "layout(set=0, binding=1, std430) writeonly buffer Dest4K { NGU_RAW d[]; };\n"
-         "layout(set=0, binding=2, std140) uniform Params { vec4 wh[" + std::to_string(9 * C) +
-         "]; vec4 bh[1]; };\n"
-         "layout(set=0, binding=3, std430) readonly buffer OrigSrc { NGU_RAW src_in[]; };\n"
-         "layout(push_constant, std430) uniform Push { uint width, height, plane_stride, src_s, dst_s, dst_w, dst_h, k3; } pc;\n"
-         "shared vec4 tile[" + std::to_string(G) + "][14][34];\n"
-         "shared NGU_RAW src_u_t[14][34];\n"
-         "void main() {\n"
-         "    uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y;\n"
-         "    int bx = int(gl_WorkGroupID.x) * 32, by = int(gl_WorkGroupID.y) * 12;\n" +
-         emit_32x12_halo_load("tile", "feat", "pc.width", G, 1, 2, 14) +
-         emit_32x12_halo_load("src_u_t", "src_in", "pc.src_s", 0, 1, 2, 14) +
-         "    barrier();\n"
-         "    uint x = uint(bx) + tx, y0 = uint(by) + ty * 3u;\n"
-         "    if (x >= pc.width || y0 >= pc.height) return;\n"
-         "    {\n"
-         "        uint yl = ty * 3u;\n"
-         "        vec4 h0 = bh[0], h1 = h0, h2 = h0;\n" +
-         emit_nc4_3py_loop("wh", "tile", "h", C, 0, 1, 1, false, false) +
-         emit_3py_head_combine_and_store(true, 1) +
-         "    }\n}\n";
-    return s;
-}
-
-// 32x12 119-quad + 3py: body + head/combine, or two body layers.
-// FP16 shares each weight across four pixels without changing the tap order.
-std::string gen_tail_32x12(int C, bool aa, bool body_only = false) const {
-    const int G = C / 4;
-    std::string s = shader_preamble;
-    s += "layout(local_size_x=32, local_size_y=4, local_size_z=1) in;\n"
-         "layout(set=0, binding=0, std430) readonly buffer Features { vec4 s[]; };\n";
-    s += body_only ? "layout(set=0, binding=1, std430) writeonly buffer Dest { vec4 d[]; };\n" : aa ? "layout(set=0, binding=1, std430) writeonly buffer Dest4K { NGU_RAW d[]; };\n"
-            : "layout(set=0, binding=1, std430) writeonly buffer Dest4K { float d[]; };\n";
-    s += "layout(set=0, binding=2, std140) uniform Params { vec4 w0[" + std::to_string(9 * C * G) +
-         "]; vec4 b0[" + std::to_string(G) + "]; vec4 wh[" + std::to_string(body_only ? 9*C*G : 9*C) + "]; vec4 bh[" + std::to_string(body_only ? G : 1) + "]; };\n";
-    s += aa ? "layout(set=0, binding=3, std430) readonly buffer OrigSrc { NGU_RAW src_in[]; };\n"
-            : "layout(set=0, binding=3, std430) readonly buffer OrigSrc { float src_in[]; };\n";
-    s += "layout(push_constant, std430) uniform Push { uint width, height, plane_stride, src_s, dst_s, dst_w, dst_h, k3; } pc;\n"
-         "shared vec4 smem[" + std::to_string(G) + "][16][36];\n";
-    if (!body_only && aa)
-        s += "shared NGU_RAW src_u_t[13][33];\n";
-    else if (!body_only)
-        s += "shared float src_t[16][36];\nshared float bx_t[16][64];\n";
-    s += "void main() {\n"
-         "    uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y, tid = ty * 32u + tx;\n"
-         "    int bx = int(gl_WorkGroupID.x) * 32, by = int(gl_WorkGroupID.y) * 12;\n" +
-         emit_32x12_halo_load("smem", "s", "pc.width", G, 2, 4, 16) +
-         (body_only ? "" : aa ? emit_32x12_halo_load("src_u_t", "src_in", "pc.src_s", 0, 0, 1, 13)
-             : emit_32x12_halo_load("src_t", "src_in", "pc.src_s", 0, 2, 4, 16)) +
-         "    barrier();\n";
-    if (!body_only && !aa) {
-        s += "    {\n"
-             "        float ca = uintBitsToFloat(0x3f5f3333u), cb = uintBitsToFloat(0x3e766666u);\n"
-             "        float cc = uintBitsToFloat(0xbdaccccdu), cd = uintBitsToFloat(0xbce66666u);\n"
-             "        for (uint sy = ty; sy < 16u; sy += 4u) {\n"
-             "            float s0=src_t[sy][tx+0u], s1=src_t[sy][tx+1u], s2=src_t[sy][tx+2u], s3=src_t[sy][tx+3u], s4=src_t[sy][tx+4u];\n"
-             "            bx_t[sy][tx*2u+0u] = (((cd*s0)+(cb*s1))+(ca*s2))+(cc*s3);\n"
-             "            bx_t[sy][tx*2u+1u] = (((cc*s1)+(ca*s2))+(cb*s3))+(cd*s4);\n"
-             "        }\n    }\n";
-    }
-    const char *comps[4] = {"x", "y", "z", "w"};
-    for (int og = 0; og < G; ++og)
-        s += "    vec4 q00_" + std::to_string(og) + ", q01_" + std::to_string(og) + ", q10_" +
-             std::to_string(og) + ", q11_" + std::to_string(og) + ";\n";
-    s += "    uint qy = 0u, qx = 0u, py0 = 0u, px0 = 0u;\n"
-         "    if (tid < 119u) {\n"
-         "        qy = tid / 17u; qx = tid - qy * 17u; py0 = qy * 2u; px0 = qx * 2u;\n";
-    for (int og = 0; og < G; ++og)
-        s += "        q00_" + std::to_string(og) + "=b0[" + std::to_string(og) + "]; q01_" +
-             std::to_string(og) + "=q00_" + std::to_string(og) + "; q10_" + std::to_string(og) + "=q00_" +
-             std::to_string(og) + "; q11_" + std::to_string(og) + "=q00_" + std::to_string(og) + ";\n";
-    if (half) {
-        // Reuse a 2x4 patch across four output pixels. kx/ic are emitted in
-        // scalar-oracle order; ky stays rolled to bound the instruction cache.
-        s += "        for (uint ky=0u; ky<pc.k3; ++ky) {\n";
-        for (int ig = 0; ig < G; ++ig) {
-            for (int row = 0; row < 2; ++row)
-                for (int col = 0; col < 4; ++col)
-                    s += "            vec4 t" + std::to_string(ig) + "_" + std::to_string(row) + "_" + std::to_string(col) +
-                         "=smem[" + std::to_string(ig) + "][py0+ky+" + std::to_string(row) + "u][px0+" + std::to_string(col) + "u];\n";
-        }
+        // Head: 26x26 = 13x13 quads + 4K combine
+        s += "    vec4 q0=vec4(0.0), q1=vec4(0.0), q2=vec4(0.0), q3=vec4(0.0);\n"
+             "    if (tx < 13u && ty < 13u) {\n"
+             "        int xl = max(0, 1 - bx), xh = min(27, int(pc.width) - bx);\n"
+             "        int ylo = max(0, 1 - by), yhi = min(27, int(pc.height) - by);\n" +
+             emit_bias_init_n(1, std::to_string(stages[3].b_uoff) + "u", "q", 4, "        ", 3) +
+             "        uint u_idx = " + std::to_string(stages[3].w_uoff) + "u;\n"
+             "        uint rx0=uint(clamp(int(px0)+0,xl,xh)), rx1=uint(clamp(int(px0)+1,xl,xh)), "
+             "rx2=uint(clamp(int(px0)+2,xl,xh)), rx3=uint(clamp(int(px0)+3,xl,xh));\n"
+             "        [[dont_unroll]] for (uint ky = 0u; ky < pc.k3; ++ky) {\n"
+             "            uint ry0 = uint(clamp(int(py0 + ky) + 0, ylo, yhi));\n"
+             "            uint ry1 = uint(clamp(int(py0 + ky) + 1, ylo, yhi));\n"
+             "            vec4 t0_00=tile[0][ry0][rx0], t0_01=tile[0][ry0][rx1], t0_02=tile[0][ry0][rx2], t0_03=tile[0][ry0][rx3];\n"
+             "            vec4 t0_10=tile[0][ry1][rx0], t0_11=tile[0][ry1][rx1], t0_12=tile[0][ry1][rx2], t0_13=tile[0][ry1][rx3];\n"
+             "            vec4 t1_00=tile[1][ry0][rx0], t1_01=tile[1][ry0][rx1], t1_02=tile[1][ry0][rx2], t1_03=tile[1][ry0][rx3];\n"
+             "            vec4 t1_10=tile[1][ry1][rx0], t1_11=tile[1][ry1][rx1], t1_12=tile[1][ry1][rx2], t1_13=tile[1][ry1][rx3];\n";
         for (int kx = 0; kx < 3; ++kx)
-            for (int ig = 0; ig < G; ++ig)
-                for (int c = 0; c < 4; ++c)
-                    for (int og = 0; og < G; ++og) {
-                        s += "            { vec4 w=w0[ky*" + std::to_string(3*C*G) + "u+" +
-                             std::to_string((kx*C+ig*4+c)*G+og) + "u]; ";
-                        for (int row = 0; row < 2; ++row)
-                            for (int col = 0; col < 2; ++col)
-                                s += "q" + std::to_string(row) + std::to_string(col) + "_" + std::to_string(og) +
-                                     "+=t" + std::to_string(ig) + "_" + std::to_string(row) + "_" + std::to_string(kx+col) +
-                                     "." + comps[c] + "*w; ";
+            for (int ig = 0; ig < 2; ++ig)
+                for (int c = 0; c < 4; c += 2) {
+                    const int u_loc = (kx * 2 + ig) * 2 + c / 2;
+                    const std::string tag = "lh_" + std::to_string(u_loc);
+                    const std::string ta0 = "t" + std::to_string(ig) + "_0" + std::to_string(kx);
+                    const std::string tb0 = "t" + std::to_string(ig) + "_0" + std::to_string(kx + 1);
+                    const std::string ta1 = "t" + std::to_string(ig) + "_1" + std::to_string(kx);
+                    const std::string tb1 = "t" + std::to_string(ig) + "_1" + std::to_string(kx + 1);
+                    s += "            { NGU_LOAD_PAIR(u_idx + " + std::to_string(u_loc) + "u, uw_" + tag + ", wa_" + tag + ", wb_" + tag + "); "
+                         "NGU_MAC(q0, " + ta0 + "." + comps[c] + ", wa_" + tag + "); "
+                         "NGU_MAC(q1, " + tb0 + "." + comps[c] + ", wa_" + tag + "); "
+                         "NGU_MAC(q2, " + ta1 + "." + comps[c] + ", wa_" + tag + "); "
+                         "NGU_MAC(q3, " + tb1 + "." + comps[c] + ", wa_" + tag + "); "
+                         "NGU_MAC(q0, " + ta0 + "." + comps[c + 1] + ", wb_" + tag + "); "
+                         "NGU_MAC(q1, " + tb0 + "." + comps[c + 1] + ", wb_" + tag + "); "
+                         "NGU_MAC(q2, " + ta1 + "." + comps[c + 1] + ", wb_" + tag + "); "
+                         "NGU_MAC(q3, " + tb1 + "." + comps[c + 1] + ", wb_" + tag + "); }\n";
+                }
+        s += "            u_idx += 12u;\n"
+             "        }\n    }\n";
+        if (!aa) {
+            s += "    barrier();\n"
+                 "    {\n"
+                 "        float ca = uintBitsToFloat(0x3f5f3333u), cb = uintBitsToFloat(0x3e766666u);\n"
+                 "        float cc = uintBitsToFloat(0xbdaccccdu), cd = uintBitsToFloat(0xbce66666u);\n"
+                 "        for (uint idx = tid; idx < 780u; idx += 256u) {\n"
+                 "            uint sy = idx / 26u, lx = idx - sy * 26u;\n"
+                 "            float s0=src_t[sy+2u][lx+2u], s1=src_t[sy+2u][lx+3u], s2=src_t[sy+2u][lx+4u], s3=src_t[sy+2u][lx+5u], s4=src_t[sy+2u][lx+6u];\n"
+                 "            tile[0][sy][lx].x = (((cd*s0)+(cb*s1))+(ca*s2))+(cc*s3);\n"
+                 "            tile[0][sy][lx].y = (((cc*s1)+(ca*s2))+(cb*s3))+(cd*s4);\n"
+                 "        }\n    }\n    barrier();\n";
+        }
+        s += "    if (tx >= 13u || ty >= 13u) return;\n";
+        if (!aa) {
+            s += "    float ca = uintBitsToFloat(0x3f5f3333u), cb = uintBitsToFloat(0x3e766666u);\n"
+                 "    float cc = uintBitsToFloat(0xbdaccccdu), cd = uintBitsToFloat(0xbce66666u);\n";
+        }
+        for (int qy_sub = 0; qy_sub < 2; ++qy_sub)
+            for (int qx_sub = 0; qx_sub < 2; ++qx_sub) {
+                const int qi = qy_sub * 2 + qx_sub;
+                const std::string qn = "q" + std::to_string(qi);
+                const std::string lx_s = "px0 + " + std::to_string(qx_sub) + "u";
+                const std::string ly_s = "py0 + " + std::to_string(qy_sub) + "u";
+                s += "    {\n"
+                     "        uint x = uint(bx) + " + lx_s + ", y = uint(by) + " + ly_s + ";\n"
+                     "        if (x < pc.width && y < pc.height) {\n"
+                     "            uint ox = x * 2u, oy = y * 2u;\n";
+                if (aa) {
+                    const std::string sx0 = "px0 + " + std::to_string(4 + qx_sub) + "u";
+                    const std::string sx1 = "px0 + " + std::to_string(5 + qx_sub) + "u";
+                    const std::string sy0 = "py0 + " + std::to_string(4 + qy_sub) + "u";
+                    const std::string sy1 = "py0 + " + std::to_string(5 + qy_sub) + "u";
+                    s += "            NGU_RAW u00 = src_t[" + sy0 + "][" + sx0 + "];\n"
+                         "            float s00 = NGU_FROM_RAW(u00);\n"
+                         "            float s10 = NGU_FROM_RAW(src_t[" + sy0 + "][" + sx1 + "]);\n"
+                         "            float s01 = NGU_FROM_RAW(src_t[" + sy1 + "][" + sx0 + "]);\n"
+                         "            float s11 = NGU_FROM_RAW(src_t[" + sy1 + "][" + sx1 + "]);\n"
+                         "            precise float p10 = (s00 + s10) * 0.5 + " + qn + ".y;\n"
+                         "            precise float p01 = (s00 + s01) * 0.5 + " + qn + ".x;\n"
+                         "            precise float p11 = (((s00 + s10) + s01) + s11) * 0.25 + " + qn + ".z;\n"
+                         "            d[(oy + 0u) * pc.dst_s + ox + 0u] = u00;\n"
+                         "            d[(oy + 0u) * pc.dst_s + ox + 1u] = NGU_TO_RAW(p10);\n"
+                         "            d[(oy + 1u) * pc.dst_s + ox + 0u] = NGU_TO_RAW(p01);\n"
+                         "            d[(oy + 1u) * pc.dst_s + ox + 1u] = NGU_TO_RAW(p11);\n";
+                } else {
+                    s += "            float r0a=tile[0][" + ly_s + "+0u][" + lx_s + "].x, r1a=tile[0][" + ly_s + "+1u][" + lx_s + "].x, "
+                         "r2a=tile[0][" + ly_s + "+2u][" + lx_s + "].x, r3a=tile[0][" + ly_s + "+3u][" + lx_s + "].x, r4a=tile[0][" + ly_s + "+4u][" + lx_s + "].x;\n"
+                         "            float r0b=tile[0][" + ly_s + "+0u][" + lx_s + "].y, r1b=tile[0][" + ly_s + "+1u][" + lx_s + "].y, "
+                         "r2b=tile[0][" + ly_s + "+2u][" + lx_s + "].y, r3b=tile[0][" + ly_s + "+3u][" + lx_s + "].y, r4b=tile[0][" + ly_s + "+4u][" + lx_s + "].y;\n"
+                         "            precise float p00 = ((((cd*r0a)+(cb*r1a))+(ca*r2a))+(cc*r3a)) + " + qn + ".x;\n"
+                         "            precise float p10 = ((((cd*r0b)+(cb*r1b))+(ca*r2b))+(cc*r3b)) + " + qn + ".y;\n"
+                         "            precise float p01 = ((((cc*r1a)+(ca*r2a))+(cb*r3a))+(cd*r4a)) + " + qn + ".z;\n"
+                         "            precise float p11 = ((((cc*r1b)+(ca*r2b))+(cb*r3b))+(cd*r4b)) + " + qn + ".w;\n"
+                         "            d[(oy + 0u) * pc.dst_s + ox + 0u] = p00;\n"
+                         "            d[(oy + 0u) * pc.dst_s + ox + 1u] = p10;\n"
+                         "            d[(oy + 1u) * pc.dst_s + ox + 0u] = p01;\n"
+                         "            d[(oy + 1u) * pc.dst_s + ox + 1u] = p11;\n";
+                }
+                s += "        }\n    }\n";
+            }
+        s += "}\n";
+        return s;
+    }
+
+    // 2. 1-Layer Warp-Stripe (32 x (wg_y*py), local_size=(32, wg_y)):
+    // 100% immediate constant-bank UBO addressing (zero dynamic LDC VGPRs):
+    // - FP16 C=16 (8w, 2py -> 32x16): regs=36, 5 blocks/SM (40 warps/SM), 354 us/layer!
+    // - FP32 C=16 (6w, 2py -> 32x12): regs=81, 3 blocks/SM (18 warps/SM), 544 us/layer!
+    // - FP32 C=12 (6w, 2py -> 32x12): regs=62, 4 blocks/SM (24 warps/SM), 271 us/layer!
+    // - FP16 C=12 (4w, 3py -> 32x12): regs=39, 6 blocks/SM (24 warps/SM), 219 us/layer!
+    std::string gen_1L_stripe(const StageDesc &st, std::uint32_t total_uvec4,
+                              int wg_y, int py, bool spatial = false) const {
+        const int g = st.c_in / 4;
+        const int th = wg_y * py, rows = th + 2;
+        const char *comps[4] = {"x", "y", "z", "w"};
+        std::string s = shader_preamble;
+        s += "layout(local_size_x=32, local_size_y=" + std::to_string(wg_y) + ", local_size_z=1) in;\n"
+             "layout(set=0, binding=0, std430) readonly buffer Source { vec4 s[]; };\n"
+             "layout(set=0, binding=1, std430) writeonly buffer Dest { vec4 d[]; };\n"
+             "NGU_UBO_DECL(" + std::to_string(total_uvec4 * 2) + ", " + std::to_string(total_uvec4) + ")\n"
+             "layout(set=0, binding=3, std430) readonly buffer Aux { float aux_unused[]; };\n"
+             "layout(push_constant, std430) uniform Push { uint width, height, plane_stride, src_s, dst_s, dst_w, dst_h, k3; } pc;\n"
+             "shared vec4 tile[" + std::to_string(g) + "][" + std::to_string(rows) + "][34];\n"
+             "void main() {\n"
+             "    uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y, yl = ty * " + std::to_string(py) + "u;\n"
+             "    int bx = int(gl_WorkGroupID.x) * 32, by = int(gl_WorkGroupID.y) * " + std::to_string(th) + ";\n"
+             "    uint gx = uint(clamp(bx + int(tx) - 1, 0, int(pc.width) - 1));\n"
+             "    uint gx_r = uint(clamp(bx + 32 + int(tx) - 1, 0, int(pc.width) - 1));\n"
+             "    for (uint sy = ty; sy < " + std::to_string(rows) + "u; sy += " + std::to_string(wg_y) + "u) {\n"
+             "        uint row = uint(clamp(by + int(sy) - 1, 0, int(pc.height) - 1)) * pc.width;\n"
+             "        for (int gi = 0; gi < " + std::to_string(g) + "; ++gi) {\n"
+             "            uint ps = uint(gi) * pc.plane_stride + row;\n"
+             "            tile[gi][sy][tx] = s[ps + gx];\n"
+             "            if (tx < 2u) tile[gi][sy][32u + tx] = s[ps + gx_r];\n"
+             "        }\n    }\n    barrier();\n"
+             "    uint x = uint(bx) + tx, y0 = uint(by) + yl;\n"
+             "    if (x >= pc.width || y0 >= pc.height) return;\n";
+        for (int p = 0; p < py; ++p)
+            for (int og = 0; og < g; ++og)
+                s += "    vec4 p" + std::to_string(p) + "_" + std::to_string(og) + ";\n";
+        s += emit_bias_init_n(g, std::to_string(st.b_uoff) + "u", "p", py, "    ", 1);
+
+        if (spatial) {
+            for (int ky = 0; ky < 3; ++ky)
+                for (int kx = 0; kx < 3; ++kx)
+                    for (int ig = 0; ig < g; ++ig) {
+                        s += "    {\n";
+                        for (int p = 0; p < py; ++p)
+                            s += "        vec4 t" + std::to_string(p) + " = tile[" + std::to_string(ig) + "][yl + " +
+                                 std::to_string(ky + p) + "u][tx + " + std::to_string(kx) + "u];\n";
+                        const std::uint32_t base = st.w_uoff + static_cast<std::uint32_t>(((ky * 3 + kx) * g + ig) * (2 * g));
+                        for (int f = 0; f < 4 * g; f += 2) {
+                            const int c0 = f / g, og0 = f % g, c1 = (f + 1) / g, og1 = (f + 1) % g;
+                            const std::string tg = "sp_" + std::to_string(ky) + "_" + std::to_string(kx) + "_" + std::to_string(ig) + "_" + std::to_string(f / 2);
+                            s += "        { NGU_LOAD_PAIR(" + std::to_string(base + f / 2) + "u, u_" + tg + ", wa_" + tg + ", wb_" + tg + "); ";
+                            for (int p = 0; p < py; ++p)
+                                s += "NGU_MAC(p" + std::to_string(p) + "_" + std::to_string(og0) + ", t" + std::to_string(p) + "." + comps[c0] + ", wa_" + tg + "); ";
+                            for (int p = 0; p < py; ++p)
+                                s += "NGU_MAC(p" + std::to_string(p) + "_" + std::to_string(og1) + ", t" + std::to_string(p) + "." + comps[c1] + ", wb_" + tg + "); ";
+                            s += "}\n";
+                        }
+                        s += "    }\n";
+                    }
+        } else {
+            for (int kx = 0; kx < 3; ++kx)
+                for (int ig = 0; ig < g; ++ig) {
+                    s += "    {\n";
+                    for (int r = 0; r < py + 2; ++r)
+                        s += "        vec4 t" + std::to_string(r) + " = tile[" + std::to_string(ig) + "][yl + " +
+                             std::to_string(r) + "u][tx + " + std::to_string(kx) + "u];\n";
+                    const std::uint32_t base = st.w_uoff + static_cast<std::uint32_t>((kx * g + ig) * (6 * g));
+                    for (int ky = 0; ky < 3; ++ky)
+                        for (int f = 0; f < 4 * g; f += 2) {
+                            const int c0 = f / g, og0 = f % g, c1 = (f + 1) / g, og1 = (f + 1) % g;
+                            const std::string tg = std::to_string(kx) + "_" + std::to_string(ig) + "_" + std::to_string(ky) + "_" + std::to_string(f / 2);
+                            s += "        { NGU_LOAD_PAIR(" + std::to_string(base + ky * 2 * g + f / 2) + "u, u_" + tg + ", wa_" + tg + ", wb_" + tg + "); ";
+                            for (int p = 0; p < py; ++p)
+                                s += "NGU_MAC(p" + std::to_string(p) + "_" + std::to_string(og0) + ", t" + std::to_string(ky + p) + "." + comps[c0] + ", wa_" + tg + "); ";
+                            for (int p = 0; p < py; ++p)
+                                s += "NGU_MAC(p" + std::to_string(p) + "_" + std::to_string(og1) + ", t" + std::to_string(ky + p) + "." + comps[c1] + ", wb_" + tg + "); ";
+                            s += "}\n";
+                        }
+                    s += "    }\n";
+                }
+        }
+        for (int p = 0; p < py; ++p) {
+            if (p > 0) s += "    if (y0 + " + std::to_string(p) + "u < pc.height) {\n";
+            s += "    { uint ob = (y0 + " + std::to_string(p) + "u) * pc.width + x;\n";
+            for (int og = 0; og < g; ++og) {
+                const std::string pn = "p" + std::to_string(p) + "_" + std::to_string(og);
+                s += "      d[" + std::to_string(og) + "u * pc.plane_stride + ob] = mix(" + pn + ", " + pn + "*0.1, lessThan(" + pn + ", vec4(0.0)));\n";
+            }
+            s += "    }\n";
+            if (p > 0) s += "    }\n";
+        }
+        s += "}\n";
+        return s;
+    }
+
+    // 3. 2-Layer Same-Channel ColumnGroupRows Warp-Stripe (`30 x th`, ZERO bank conflicts, -50% DRAM traffic!):
+    std::string gen_2L_col_stripe(std::span<const StageDesc> stages, std::uint32_t total_uvec4,
+                                  int wg_y, int py, bool full_unroll) const {
+        const int g = stages[0].c_in / 4;
+        const int tw = 30, th = wg_y * py - 2, rows = wg_y * py + 2;
+        const char *comps[4] = {"x", "y", "z", "w"};
+        std::string s = shader_preamble;
+        s += "layout(local_size_x=32, local_size_y=" + std::to_string(wg_y) + ", local_size_z=1) in;\n"
+             "layout(set=0, binding=0, std430) readonly buffer Source { vec4 s[]; };\n"
+             "layout(set=0, binding=1, std430) writeonly buffer Dest { vec4 d[]; };\n"
+             "NGU_UBO_DECL(" + std::to_string(total_uvec4 * 2) + ", " + std::to_string(total_uvec4) + ")\n"
+             "layout(set=0, binding=3, std430) readonly buffer Aux { float aux_unused[]; };\n"
+             "layout(push_constant, std430) uniform Push { uint width, height, plane_stride, src_s, dst_s, dst_w, dst_h, k3; } pc;\n"
+             "shared vec4 tile[" + std::to_string(g) + "][" + std::to_string(rows) + "][34];\n"
+             "void main() {\n"
+             "    uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y, yl = ty * " + std::to_string(py) + "u;\n"
+             "    int bx = int(gl_WorkGroupID.x) * 30, by = int(gl_WorkGroupID.y) * " + std::to_string(th) + ";\n"
+             "    uint gx = uint(clamp(bx + int(tx) - 2, 0, int(pc.width) - 1));\n"
+             "    uint gx_r = uint(clamp(bx + 32 + int(tx) - 2, 0, int(pc.width) - 1));\n"
+             "    for (uint sy = ty; sy < " + std::to_string(rows) + "u; sy += " + std::to_string(wg_y) + "u) {\n"
+             "        uint row = uint(clamp(by + int(sy) - 2, 0, int(pc.height) - 1)) * pc.width;\n"
+             "        for (int gi = 0; gi < " + std::to_string(g) + "; ++gi) {\n"
+             "            uint ps = uint(gi) * pc.plane_stride + row;\n"
+             "            tile[gi][sy][tx] = s[ps + gx];\n"
+             "            if (tx < 2u) tile[gi][sy][32u + tx] = s[ps + gx_r];\n"
+             "        }\n    }\n    barrier();\n";
+
+        if (full_unroll) {
+            s += "    {\n";
+            for (int p = 0; p < py; ++p)
+                for (int og = 0; og < g; ++og)
+                    s += "        vec4 p" + std::to_string(p) + "_" + std::to_string(og) + ";\n";
+            s += emit_bias_init_n(g, std::to_string(stages[0].b_uoff) + "u", "p", py, "        ", 20);
+            for (int kx = 0; kx < 3; ++kx)
+                for (int ig = 0; ig < g; ++ig) {
+                    s += "        {\n";
+                    for (int r = 0; r < py + 2; ++r)
+                        s += "            vec4 t" + std::to_string(r) + " = tile[" + std::to_string(ig) + "][yl + " +
+                             std::to_string(r) + "u][tx + " + std::to_string(kx) + "u];\n";
+                    const std::uint32_t base = stages[0].w_uoff + static_cast<std::uint32_t>((kx * g + ig) * (6 * g));
+                    for (int ky = 0; ky < 3; ++ky)
+                        for (int f = 0; f < 4 * g; f += 2) {
+                            const int c0 = f / g, og0 = f % g, c1 = (f + 1) / g, og1 = (f + 1) % g;
+                            const std::string tg = "c0_" + std::to_string(kx) + "_" + std::to_string(ig) + "_" + std::to_string(ky) + "_" + std::to_string(f / 2);
+                            s += "            { NGU_LOAD_PAIR(" + std::to_string(base + ky * 2 * g + f / 2) + "u, u_" + tg + ", wa_" + tg + ", wb_" + tg + "); ";
+                            for (int p = 0; p < py; ++p)
+                                s += "NGU_MAC(p" + std::to_string(p) + "_" + std::to_string(og0) + ", t" + std::to_string(ky + p) + "." + comps[c0] + ", wa_" + tg + "); ";
+                            for (int p = 0; p < py; ++p)
+                                s += "NGU_MAC(p" + std::to_string(p) + "_" + std::to_string(og1) + ", t" + std::to_string(ky + p) + "." + comps[c1] + ", wb_" + tg + "); ";
+                            s += "}\n";
+                        }
+                    s += "        }\n";
+                }
+            s += "        barrier();\n";
+            for (int p = 0; p < py; ++p)
+                for (int og = 0; og < g; ++og) {
+                    const std::string pn = "p" + std::to_string(p) + "_" + std::to_string(og);
+                    s += "        tile[" + std::to_string(og) + "][yl+" + std::to_string(p) + "u][tx] = mix(" + pn + ", " + pn + "*0.1, lessThan(" + pn + ", vec4(0.0)));\n";
+                }
+            s += "        barrier();\n    }\n"
+                 "    if (tx >= 30u || uint(bx) + tx >= pc.width) return;\n";
+            for (int p = 0; p < py; ++p)
+                for (int og = 0; og < g; ++og)
+                    s += "    vec4 p" + std::to_string(p) + "_" + std::to_string(og) + ";\n";
+            s += emit_bias_init_n(g, std::to_string(stages[1].b_uoff) + "u", "p", py, "    ", 21) +
+                 "    int xl = max(0, 1 - bx), xh = min(31, int(pc.width) - bx);\n"
+                 "    int ylo = max(0, 1 - by), yhi = min(" + std::to_string(th + 1) + ", int(pc.height) - by);\n";
+            for (int r = 0; r < py + 2; ++r)
+                s += "    uint ry" + std::to_string(r) + " = uint(clamp(int(yl) + " + std::to_string(r) + ", ylo, yhi));\n";
+            for (int kx = 0; kx < 3; ++kx) {
+                s += "    { uint rx = uint(clamp(int(tx) + " + std::to_string(kx) + ", xl, xh));\n";
+                for (int ig = 0; ig < g; ++ig) {
+                    s += "      {\n";
+                    for (int r = 0; r < py + 2; ++r)
+                        s += "        vec4 t" + std::to_string(r) + " = tile[" + std::to_string(ig) + "][ry" + std::to_string(r) + "][rx];\n";
+                    const std::uint32_t base = stages[1].w_uoff + static_cast<std::uint32_t>((kx * g + ig) * (6 * g));
+                    for (int ky = 0; ky < 3; ++ky)
+                        for (int f = 0; f < 4 * g; f += 2) {
+                            const int c0 = f / g, og0 = f % g, c1 = (f + 1) / g, og1 = (f + 1) % g;
+                            const std::string tg = "c1_" + std::to_string(kx) + "_" + std::to_string(ig) + "_" + std::to_string(ky) + "_" + std::to_string(f / 2);
+                            s += "        { NGU_LOAD_PAIR(" + std::to_string(base + ky * 2 * g + f / 2) + "u, u_" + tg + ", wa_" + tg + ", wb_" + tg + "); ";
+                            for (int p = 0; p < py; ++p)
+                                s += "NGU_MAC(p" + std::to_string(p) + "_" + std::to_string(og0) + ", t" + std::to_string(ky + p) + "." + comps[c0] + ", wa_" + tg + "); ";
+                            for (int p = 0; p < py; ++p)
+                                s += "NGU_MAC(p" + std::to_string(p) + "_" + std::to_string(og1) + ", t" + std::to_string(ky + p) + "." + comps[c1] + ", wb_" + tg + "); ";
+                            s += "}\n";
+                        }
+                    s += "      }\n";
+                }
+                s += "    }\n";
+            }
+            for (int p = 0; p < py; ++p) {
+                s += "    if (yl + " + std::to_string(p) + "u < " + std::to_string(th) + "u && uint(by) + yl + " + std::to_string(p) + "u < pc.height) {\n"
+                     "        uint ob = (uint(by) + yl + " + std::to_string(p) + "u) * pc.width + uint(bx) + tx;\n";
+                for (int og = 0; og < g; ++og) {
+                    const std::string pn = "p" + std::to_string(p) + "_" + std::to_string(og);
+                    s += "        d[" + std::to_string(og) + "u * pc.plane_stride + ob] = mix(" + pn + ", " + pn + "*0.1, lessThan(" + pn + ", vec4(0.0)));\n";
+                }
+                s += "    }\n";
+            }
+            s += "}\n";
+            return s;
+        }
+
+        const std::uint32_t w_stride = stages[1].w_uoff - stages[0].w_uoff;
+        const std::uint32_t b_stride = stages[1].b_uoff - stages[0].b_uoff;
+        s += "    [[dont_unroll]] for (uint stg = 0u; stg < 2u; ++stg) {\n"
+             "        int xl = (stg == 0u) ? 0 : max(0, 1 - bx);\n"
+             "        int xh = (stg == 0u) ? 33 : min(31, int(pc.width) - bx);\n"
+             "        int ylo = (stg == 0u) ? 0 : max(0, 1 - by);\n"
+             "        int yhi = (stg == 0u) ? " + std::to_string(rows - 1) + " : min(" + std::to_string(th + 1) + ", int(pc.height) - by);\n";
+        for (int p = 0; p < py; ++p)
+            for (int og = 0; og < g; ++og)
+                s += "        vec4 p" + std::to_string(p) + "_" + std::to_string(og) + ";\n";
+        s += emit_bias_init_n(g, std::to_string(stages[0].b_uoff) + "u + stg * " + std::to_string(b_stride) + "u",
+                              "p", py, "        ", 2);
+        for (int r = 0; r < py + 2; ++r)
+            s += "        uint ry" + std::to_string(r) + " = uint(clamp(int(yl) + " + std::to_string(r) + ", ylo, yhi));\n";
+        s += "        [[dont_unroll]] for (uint kx = 0u; kx < pc.k3; ++kx) {\n"
+             "            uint rx = uint(clamp(int(tx + kx), xl, xh));\n"
+             "            uint kbase = " + std::to_string(stages[0].w_uoff) + "u + stg * " + std::to_string(w_stride) +
+             "u + kx * " + std::to_string(6 * g * g) + "u;\n";
+        for (int ig = 0; ig < g; ++ig) {
+            s += "            {\n";
+            for (int r = 0; r < py + 2; ++r)
+                s += "                vec4 t" + std::to_string(r) + " = tile[" + std::to_string(ig) + "][ry" + std::to_string(r) + "][rx];\n";
+            for (int ky = 0; ky < 3; ++ky)
+                for (int f = 0; f < 4 * g; f += 2) {
+                    const int c0 = f / g, og0 = f % g, c1 = (f + 1) / g, og1 = (f + 1) % g;
+                    const std::string tg = "cs_" + std::to_string(ig) + "_" + std::to_string(ky) + "_" + std::to_string(f / 2);
+                    s += "                { NGU_LOAD_PAIR(kbase + " + std::to_string(ig * 6 * g + ky * 2 * g + f / 2) + "u, u_" + tg + ", wa_" + tg + ", wb_" + tg + "); ";
+                    for (int p = 0; p < py; ++p)
+                        s += "NGU_MAC(p" + std::to_string(p) + "_" + std::to_string(og0) + ", t" + std::to_string(ky + p) + "." + comps[c0] + ", wa_" + tg + "); ";
+                    for (int p = 0; p < py; ++p)
+                        s += "NGU_MAC(p" + std::to_string(p) + "_" + std::to_string(og1) + ", t" + std::to_string(ky + p) + "." + comps[c1] + ", wb_" + tg + "); ";
+                    s += "}\n";
+                }
+            s += "            }\n";
+        }
+        s += "        }\n"
+             "        if (stg == 0u) {\n"
+             "            barrier();\n";
+        for (int p = 0; p < py; ++p)
+            for (int og = 0; og < g; ++og) {
+                const std::string pn = "p" + std::to_string(p) + "_" + std::to_string(og);
+                s += "            tile[" + std::to_string(og) + "][yl+" + std::to_string(p) + "u][tx] = mix(" + pn + ", " + pn + "*0.1, lessThan(" + pn + ", vec4(0.0)));\n";
+            }
+        s += "            barrier();\n"
+             "        } else {\n"
+             "            uint x = uint(bx) + tx, y0 = uint(by) + yl;\n"
+             "            if (tx < " + std::to_string(tw) + "u && x < pc.width) {\n";
+        for (int p = 0; p < py; ++p) {
+            s += "                if (yl + " + std::to_string(p) + "u < " + std::to_string(th) + "u && y0 + " + std::to_string(p) + "u < pc.height) {\n"
+                 "                    uint ob = (y0 + " + std::to_string(p) + "u) * pc.width + x;\n";
+            for (int og = 0; og < g; ++og) {
+                const std::string pn = "p" + std::to_string(p) + "_" + std::to_string(og);
+                s += "                    d[" + std::to_string(og) + "u * pc.plane_stride + ob] = mix(" + pn + ", " + pn + "*0.1, lessThan(" + pn + ", vec4(0.0)));\n";
+            }
+            s += "                }\n";
+        }
+        s += "            }\n        }\n    }\n}\n";
+        return s;
+    }
+
+    // 4. Standalone 32x12 3py Head + Combine (130 us FP16 C=16, 199 us FP32 C=12, 332 us FP32 C=16).
+    std::string gen_head_32x12(const StageDesc &head, std::uint32_t total_uvec4, bool aa, bool alias_bx = false) const {
+        const int g = head.c_in / 4;
+        const char *comps[4] = {"x", "y", "z", "w"};
+        std::string s = shader_preamble;
+        s += "layout(local_size_x=32, local_size_y=4, local_size_z=1) in;\n"
+             "layout(set=0, binding=0, std430) readonly buffer Features { vec4 feat[]; };\n";
+        s += aa ? "layout(set=0, binding=1, std430) writeonly buffer Dest4K { NGU_RAW d[]; };\n"
+                : "layout(set=0, binding=1, std430) writeonly buffer Dest4K { float d[]; };\n";
+        s += "NGU_UBO_DECL(" + std::to_string(total_uvec4 * 2) + ", " + std::to_string(total_uvec4) + ")\n";
+        s += aa ? "layout(set=0, binding=3, std430) readonly buffer OrigSrc { NGU_RAW src_in[]; };\n"
+                : "layout(set=0, binding=3, std430) readonly buffer OrigSrc { float src_in[]; };\n";
+        s += "layout(push_constant, std430) uniform Push { uint width, height, plane_stride, src_s, dst_s, dst_w, dst_h, k3; } pc;\n"
+             "shared vec4 tile[" + std::to_string(g) + "][14][34];\n";
+        if (aa)
+            s += "shared NGU_RAW src_u_t[14][34];\n";
+        else if (!alias_bx)
+            s += "shared float src_t[16][36];\nshared float bx_t[16][64];\n";
+        s += "void main() {\n"
+             "    uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y, yl = ty * 3u;\n"
+             "    int bx = int(gl_WorkGroupID.x) * 32, by = int(gl_WorkGroupID.y) * 12;\n"
+             "    {\n"
+             "        uint gx = uint(clamp(bx + int(tx) - 1, 0, int(pc.width) - 1));\n"
+             "        uint gx_r = uint(clamp(bx + 32 + int(tx) - 1, 0, int(pc.width) - 1));\n"
+             "        for (uint sy = ty; sy < 14u; sy += 4u) {\n"
+             "            uint row = uint(clamp(by + int(sy) - 1, 0, int(pc.height) - 1)) * pc.width;\n"
+             "            for (int gi = 0; gi < " + std::to_string(g) + "; ++gi) {\n"
+             "                uint ps = uint(gi) * pc.plane_stride + row;\n"
+             "                tile[gi][sy][tx] = feat[ps + gx];\n"
+             "                if (tx < 2u) tile[gi][sy][32u + tx] = feat[ps + gx_r];\n"
+             "            }\n";
+        if (aa) {
+            s += "            uint srow = uint(clamp(by + int(sy) - 1, 0, int(pc.height) - 1)) * pc.src_s;\n"
+                 "            src_u_t[sy][tx] = src_in[srow + gx];\n"
+                 "            if (tx < 2u) src_u_t[sy][32u + tx] = src_in[srow + gx_r];\n";
+        }
+        s += "        }\n    }\n";
+        if (!aa && !alias_bx) {
+            s += "    {\n"
+                 "        uint gx = uint(clamp(bx + int(tx) - 2, 0, int(pc.width) - 1));\n"
+                 "        uint gx_r = uint(clamp(bx + 32 + int(tx) - 2, 0, int(pc.width) - 1));\n"
+                 "        for (uint sy = ty; sy < 16u; sy += 4u) {\n"
+                 "            uint row = uint(clamp(by + int(sy) - 2, 0, int(pc.height) - 1)) * pc.src_s;\n"
+                 "            src_t[sy][tx] = src_in[row + gx];\n"
+                 "            if (tx < 4u) src_t[sy][32u + tx] = src_in[row + gx_r];\n"
+                 "        }\n    }\n";
+        }
+        s += "    barrier();\n";
+        if (!aa && !alias_bx) {
+            s += "    {\n"
+                 "        float ca = uintBitsToFloat(0x3f5f3333u), cb = uintBitsToFloat(0x3e766666u);\n"
+                 "        float cc = uintBitsToFloat(0xbdaccccdu), cd = uintBitsToFloat(0xbce66666u);\n"
+                 "        for (uint sy = ty; sy < 16u; sy += 4u) {\n"
+                 "            float s0=src_t[sy][tx+0u], s1=src_t[sy][tx+1u], s2=src_t[sy][tx+2u], s3=src_t[sy][tx+3u], s4=src_t[sy][tx+4u];\n"
+                 "            bx_t[sy][tx*2u+0u] = (((cd*s0)+(cb*s1))+(ca*s2))+(cc*s3);\n"
+                 "            bx_t[sy][tx*2u+1u] = (((cc*s1)+(ca*s2))+(cb*s3))+(cd*s4);\n"
+                 "        }\n    }\n    barrier();\n";
+        }
+        if (!alias_bx)
+            s += "    if (uint(bx) + tx >= pc.width || uint(by) + yl >= pc.height) return;\n";
+        s += "    vec4 h0, h1, h2;\n" +
+             emit_bias_init_n(1, std::to_string(head.b_uoff) + "u", "h", 3, "    ", 4);
+        if (head.col_order) {
+            for (int kx = 0; kx < 3; ++kx)
+                for (int ig = 0; ig < g; ++ig) {
+                    s += "    {\n";
+                    for (int r = 0; r < 5; ++r)
+                        s += "        vec4 t" + std::to_string(r) + " = tile[" + std::to_string(ig) + "][yl+" +
+                             std::to_string(r) + "u][tx+" + std::to_string(kx) + "u];\n";
+                    const std::uint32_t base = head.w_uoff + static_cast<std::uint32_t>((kx * g + ig) * 6);
+                    for (int ky = 0; ky < 3; ++ky)
+                        for (int c = 0; c < 4; c += 2) {
+                            const std::string tg = "hc_" + std::to_string(kx) + "_" + std::to_string(ig) + "_" + std::to_string(ky) + "_" + std::to_string(c);
+                            s += "        { NGU_LOAD_PAIR(" + std::to_string(base + ky * 2 + c / 2) + "u, u_" + tg + ", wa_" + tg + ", wb_" + tg + "); "
+                                 "NGU_MAC(h0, t" + std::to_string(ky) + "." + comps[c] + ", wa_" + tg + "); "
+                                 "NGU_MAC(h1, t" + std::to_string(ky + 1) + "." + comps[c] + ", wa_" + tg + "); "
+                                 "NGU_MAC(h2, t" + std::to_string(ky + 2) + "." + comps[c] + ", wa_" + tg + "); "
+                                 "NGU_MAC(h0, t" + std::to_string(ky) + "." + comps[c + 1] + ", wb_" + tg + "); "
+                                 "NGU_MAC(h1, t" + std::to_string(ky + 1) + "." + comps[c + 1] + ", wb_" + tg + "); "
+                                 "NGU_MAC(h2, t" + std::to_string(ky + 2) + "." + comps[c + 1] + ", wb_" + tg + "); }\n";
+                        }
+                    s += "    }\n";
+                }
+        } else {
+            for (int ky = 0; ky < 3; ++ky)
+                for (int kx = 0; kx < 3; ++kx)
+                    for (int ig = 0; ig < g; ++ig) {
+                        s += "    {\n"
+                             "        vec4 t0 = tile[" + std::to_string(ig) + "][yl+" + std::to_string(ky + 0) + "u][tx+" + std::to_string(kx) + "u];\n"
+                             "        vec4 t1 = tile[" + std::to_string(ig) + "][yl+" + std::to_string(ky + 1) + "u][tx+" + std::to_string(kx) + "u];\n"
+                             "        vec4 t2 = tile[" + std::to_string(ig) + "][yl+" + std::to_string(ky + 2) + "u][tx+" + std::to_string(kx) + "u];\n";
+                        const std::uint32_t base = head.w_uoff + static_cast<std::uint32_t>(((ky * 3 + kx) * g + ig) * 2);
+                        for (int c = 0; c < 4; c += 2) {
+                            const std::string tg = "hs_" + std::to_string(ky) + "_" + std::to_string(kx) + "_" + std::to_string(ig) + "_" + std::to_string(c);
+                            s += "        { NGU_LOAD_PAIR(" + std::to_string(base + c / 2) + "u, u_" + tg + ", wa_" + tg + ", wb_" + tg + "); "
+                                 "NGU_MAC(h0, t0." + comps[c] + ", wa_" + tg + "); "
+                                 "NGU_MAC(h1, t1." + comps[c] + ", wa_" + tg + "); "
+                                 "NGU_MAC(h2, t2." + comps[c] + ", wa_" + tg + "); "
+                                 "NGU_MAC(h0, t0." + comps[c + 1] + ", wb_" + tg + "); "
+                                 "NGU_MAC(h1, t1." + comps[c + 1] + ", wb_" + tg + "); "
+                                 "NGU_MAC(h2, t2." + comps[c + 1] + ", wb_" + tg + "); }\n";
+                        }
+                        s += "    }\n";
+                    }
+        }
+        if (!aa && alias_bx) {
+            // Reuse tile[0..1] for OrigSrc -> bx on strict 32-KB devices without extra smem
+            s += "    barrier();\n"
+                 "    {\n"
+                 "        uint gx = uint(clamp(bx + int(tx) - 2, 0, int(pc.width) - 1));\n"
+                 "        uint gx_r = uint(clamp(bx + 32 + int(tx) - 2, 0, int(pc.width) - 1));\n"
+                 "        for (uint sy = ty; sy < 16u; sy += 4u) {\n"
+                 "            uint row = uint(clamp(by + int(sy) - 2, 0, int(pc.height) - 1)) * pc.src_s;\n"
+                 "            uint sl = sy >> 1u;\n"
+                 "            if ((sy & 1u) == 0u) { tile[0][sl][tx].x = src_in[row + gx]; if (tx < 4u) tile[0][sl][32u + tx].x = src_in[row + gx_r]; }\n"
+                 "            else                 { tile[0][sl][tx].y = src_in[row + gx]; if (tx < 4u) tile[0][sl][32u + tx].y = src_in[row + gx_r]; }\n"
+                 "        }\n    }\n    barrier();\n"
+                 "    {\n"
+                 "        float ca = uintBitsToFloat(0x3f5f3333u), cb = uintBitsToFloat(0x3e766666u);\n"
+                 "        float cc = uintBitsToFloat(0xbdaccccdu), cd = uintBitsToFloat(0xbce66666u);\n"
+                 "        for (uint sy = ty; sy < 16u; sy += 4u) {\n"
+                 "            uint sl = sy >> 1u;\n"
+                 "            float s0 = (sy&1u)==0u ? tile[0][sl][tx+0u].x : tile[0][sl][tx+0u].y;\n"
+                 "            float s1 = (sy&1u)==0u ? tile[0][sl][tx+1u].x : tile[0][sl][tx+1u].y;\n"
+                 "            float s2 = (sy&1u)==0u ? tile[0][sl][tx+2u].x : tile[0][sl][tx+2u].y;\n"
+                 "            float s3 = (sy&1u)==0u ? tile[0][sl][tx+3u].x : tile[0][sl][tx+3u].y;\n"
+                 "            float s4 = (sy&1u)==0u ? tile[0][sl][tx+4u].x : tile[0][sl][tx+4u].y;\n"
+                 "            if ((sy&1u)==0u) { tile[1][sl][tx].x = (((cd*s0)+(cb*s1))+(ca*s2))+(cc*s3); tile[1][sl][tx].y = (((cc*s1)+(ca*s2))+(cb*s3))+(cd*s4); }\n"
+                 "            else             { tile[1][sl][tx].z = (((cd*s0)+(cb*s1))+(ca*s2))+(cc*s3); tile[1][sl][tx].w = (((cc*s1)+(ca*s2))+(cb*s3))+(cd*s4); }\n"
+                 "        }\n    }\n    barrier();\n"
+                 "    if (uint(bx) + tx >= pc.width || uint(by) + yl >= pc.height) return;\n";
+        }
+        s += "    uint x = uint(bx) + tx, y0 = uint(by) + yl, ox = x * 2u, c0 = tx * 2u;\n";
+        if (!aa) {
+            s += "    float ca = uintBitsToFloat(0x3f5f3333u), cb = uintBitsToFloat(0x3e766666u);\n"
+                 "    float cc = uintBitsToFloat(0xbdaccccdu), cd = uintBitsToFloat(0xbce66666u);\n";
+        }
+        for (int p = 0; p < 3; ++p) {
+            const std::string hn = "h" + std::to_string(p);
+            if (p > 0) s += "    if (y0 + " + std::to_string(p) + "u < pc.height) {\n";
+            s += "    { uint ry = yl + " + std::to_string(p) + "u, oy = (y0 + " + std::to_string(p) + "u) * 2u;\n";
+            if (aa) {
+                s += "      NGU_RAW u00 = src_u_t[ry+1u][tx+1u];\n"
+                     "      float s00 = NGU_FROM_RAW(u00);\n"
+                     "      float s10 = NGU_FROM_RAW(src_u_t[ry+1u][tx+2u]);\n"
+                     "      float s01 = NGU_FROM_RAW(src_u_t[ry+2u][tx+1u]);\n"
+                     "      float s11 = NGU_FROM_RAW(src_u_t[ry+2u][tx+2u]);\n"
+                     "      precise float p10 = (s00 + s10) * 0.5 + " + hn + ".y;\n"
+                     "      precise float p01 = (s00 + s01) * 0.5 + " + hn + ".x;\n"
+                     "      precise float p11 = (((s00 + s10) + s01) + s11) * 0.25 + " + hn + ".z;\n"
+                     "      d[(oy + 0u) * pc.dst_s + ox + 0u] = u00;\n"
+                     "      d[(oy + 0u) * pc.dst_s + ox + 1u] = NGU_TO_RAW(p10);\n"
+                     "      d[(oy + 1u) * pc.dst_s + ox + 0u] = NGU_TO_RAW(p01);\n"
+                     "      d[(oy + 1u) * pc.dst_s + ox + 1u] = NGU_TO_RAW(p11);\n";
+            } else if (alias_bx) {
+                s += "      float r0a=((ry+0u)&1u)==0u?tile[1][(ry+0u)>>1u][tx].x:tile[1][(ry+0u)>>1u][tx].z, r0b=((ry+0u)&1u)==0u?tile[1][(ry+0u)>>1u][tx].y:tile[1][(ry+0u)>>1u][tx].w;\n"
+                     "      float r1a=((ry+1u)&1u)==0u?tile[1][(ry+1u)>>1u][tx].x:tile[1][(ry+1u)>>1u][tx].z, r1b=((ry+1u)&1u)==0u?tile[1][(ry+1u)>>1u][tx].y:tile[1][(ry+1u)>>1u][tx].w;\n"
+                     "      float r2a=((ry+2u)&1u)==0u?tile[1][(ry+2u)>>1u][tx].x:tile[1][(ry+2u)>>1u][tx].z, r2b=((ry+2u)&1u)==0u?tile[1][(ry+2u)>>1u][tx].y:tile[1][(ry+2u)>>1u][tx].w;\n"
+                     "      float r3a=((ry+3u)&1u)==0u?tile[1][(ry+3u)>>1u][tx].x:tile[1][(ry+3u)>>1u][tx].z, r3b=((ry+3u)&1u)==0u?tile[1][(ry+3u)>>1u][tx].y:tile[1][(ry+3u)>>1u][tx].w;\n"
+                     "      float r4a=((ry+4u)&1u)==0u?tile[1][(ry+4u)>>1u][tx].x:tile[1][(ry+4u)>>1u][tx].z, r4b=((ry+4u)&1u)==0u?tile[1][(ry+4u)>>1u][tx].y:tile[1][(ry+4u)>>1u][tx].w;\n"
+                     "      precise float p00 = ((((cd*r0a)+(cb*r1a))+(ca*r2a))+(cc*r3a)) + " + hn + ".x;\n"
+                     "      precise float p10 = ((((cd*r0b)+(cb*r1b))+(ca*r2b))+(cc*r3b)) + " + hn + ".y;\n"
+                     "      precise float p01 = ((((cc*r1a)+(ca*r2a))+(cb*r3a))+(cd*r4a)) + " + hn + ".z;\n"
+                     "      precise float p11 = ((((cc*r1b)+(ca*r2b))+(cb*r3b))+(cd*r4b)) + " + hn + ".w;\n"
+                     "      d[(oy + 0u) * pc.dst_s + ox + 0u] = p00;\n"
+                     "      d[(oy + 0u) * pc.dst_s + ox + 1u] = p10;\n"
+                     "      d[(oy + 1u) * pc.dst_s + ox + 0u] = p01;\n"
+                     "      d[(oy + 1u) * pc.dst_s + ox + 1u] = p11;\n";
+            } else {
+                s += "      float r0a=bx_t[ry+0u][c0], r1a=bx_t[ry+1u][c0], r2a=bx_t[ry+2u][c0], r3a=bx_t[ry+3u][c0], r4a=bx_t[ry+4u][c0];\n"
+                     "      float r0b=bx_t[ry+0u][c0+1u], r1b=bx_t[ry+1u][c0+1u], r2b=bx_t[ry+2u][c0+1u], r3b=bx_t[ry+3u][c0+1u], r4b=bx_t[ry+4u][c0+1u];\n"
+                     "      precise float p00 = ((((cd*r0a)+(cb*r1a))+(ca*r2a))+(cc*r3a)) + " + hn + ".x;\n"
+                     "      precise float p10 = ((((cd*r0b)+(cb*r1b))+(ca*r2b))+(cc*r3b)) + " + hn + ".y;\n"
+                     "      precise float p01 = ((((cc*r1a)+(ca*r2a))+(cb*r3a))+(cd*r4a)) + " + hn + ".z;\n"
+                     "      precise float p11 = ((((cc*r1b)+(ca*r2b))+(cb*r3b))+(cd*r4b)) + " + hn + ".w;\n"
+                     "      d[(oy + 0u) * pc.dst_s + ox + 0u] = p00;\n"
+                     "      d[(oy + 0u) * pc.dst_s + ox + 1u] = p10;\n"
+                     "      d[(oy + 1u) * pc.dst_s + ox + 0u] = p01;\n"
+                     "      d[(oy + 1u) * pc.dst_s + ox + 1u] = p11;\n";
+            }
+            s += "    }\n";
+            if (p > 0) s += "    }\n";
+        }
+        s += "}\n";
+        return s;
+    }
+
+    // 5. Pure Warp-Stripe 2-Stage (Spatial -> Col [+ Combine]) on `30 x th` (local_size=(32, wg_y)):
+    // Eliminates ALL `tid < 119` intra-warp branch divergence AND 2x2 quad bank conflicts!
+    std::string gen_2L_spa_col_stripe(std::span<const StageDesc> stages, std::uint32_t total_uvec4,
+                                      bool aa, int wg_y, int py, bool full_unr_s1 = true) const {
+        const bool scalar_in = (stages[0].c_in == 1);
+        const bool tail_out = stages[1].is_head;
+        const int g_in0 = stages[0].c_in / 4;
+        const int g_mid = stages[0].c_out / 4;
+        const int g_last = tail_out ? 1 : (stages[1].c_out / 4);
+        const int g_smem = scalar_in ? g_mid : std::max(g_in0, g_mid);
+        const int th = wg_y * py - 2, s0_rows = wg_y * py, rows = wg_y * py + 2;
+        const char *comps[4] = {"x", "y", "z", "w"};
+
+        std::string s = shader_preamble;
+        s += "layout(local_size_x=32, local_size_y=" + std::to_string(wg_y) + ", local_size_z=1) in;\n";
+        s += scalar_in
+            ? "layout(set=0, binding=0, std430) readonly buffer Source { float s[]; };\n"
+            : "layout(set=0, binding=0, std430) readonly buffer Source { vec4 s[]; };\n";
+        if (tail_out) {
+            s += aa ? "layout(set=0, binding=1, std430) writeonly buffer Dest4K { NGU_RAW d[]; };\n"
+                    : "layout(set=0, binding=1, std430) writeonly buffer Dest4K { float d[]; };\n";
+        } else {
+            s += "layout(set=0, binding=1, std430) writeonly buffer Dest { vec4 d[]; };\n";
+        }
+        s += "NGU_UBO_DECL(" + std::to_string(total_uvec4 * 2) + ", " + std::to_string(total_uvec4) + ")\n";
+        if (tail_out) {
+            s += aa ? "layout(set=0, binding=3, std430) readonly buffer OrigSrc { NGU_RAW src_in[]; };\n"
+                    : "layout(set=0, binding=3, std430) readonly buffer OrigSrc { float src_in[]; };\n";
+        } else {
+            s += "layout(set=0, binding=3, std430) readonly buffer Aux { float aux_unused[]; };\n";
+        }
+        s += "layout(push_constant, std430) uniform Push { uint width, height, plane_stride, src_s, dst_s, dst_w, dst_h, k3; } pc;\n";
+
+        if (scalar_in) {
+            s += "shared float src_t[" + std::to_string(rows) + "][36];\n"
+                 "shared vec4 smem[" + std::to_string(g_smem) + "][" + std::to_string(s0_rows) + "][34];\n";
+        } else {
+            s += "shared vec4 smem[" + std::to_string(g_smem) + "][" + std::to_string(rows) + "][34];\n";
+            if (tail_out && aa)
+                s += "shared NGU_RAW src_u_t[" + std::to_string(th + 1) + "][32];\n";
+            else if (tail_out)
+                s += "shared float src_t[" + std::to_string(rows) + "][36];\n";
+        }
+
+        s += "void main() {\n"
+             "    uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y, yl = ty * " + std::to_string(py) + "u;\n"
+             "    int bx = int(gl_WorkGroupID.x) * 30, by = int(gl_WorkGroupID.y) * " + std::to_string(th) + ";\n"
+             "    {\n"
+             "        uint gx = uint(clamp(bx + int(tx) - 2, 0, int(pc.width) - 1));\n"
+             "        uint gx_r = uint(clamp(bx + 32 + int(tx) - 2, 0, int(pc.width) - 1));\n"
+             "        for (uint sy = ty; sy < " + std::to_string(rows) + "u; sy += " + std::to_string(wg_y) + "u) {\n"
+             "            uint cy = uint(clamp(by + int(sy) - 2, 0, int(pc.height) - 1));\n";
+        if (scalar_in) {
+            s += "            uint srow = cy * pc.src_s;\n"
+                 "            src_t[sy][tx] = s[srow + gx];\n"
+                 "            if (tx < 2u) src_t[sy][32u + tx] = s[srow + gx_r];\n";
+        } else {
+            s += "            uint row = cy * pc.width;\n"
+                 "            for (int gi = 0; gi < " + std::to_string(g_in0) + "; ++gi) {\n"
+                 "                uint ps = uint(gi) * pc.plane_stride + row;\n"
+                 "                smem[gi][sy][tx] = s[ps + gx];\n"
+                 "                if (tx < 2u) smem[gi][sy][32u + tx] = s[ps + gx_r];\n"
+                 "            }\n";
+            if (tail_out && !aa) {
+                s += "            uint srow = cy * pc.src_s;\n"
+                     "            src_t[sy][tx] = src_in[srow + gx];\n"
+                     "            if (tx < 4u) src_t[sy][32u + tx] = src_in[srow + gx_r];\n";
+            }
+        }
+        s += "        }\n    }\n";
+        if (tail_out && aa) {
+            s += "    if (tx < 31u) {\n"
+                 "        uint sgx = uint(clamp(bx + int(tx), 0, int(pc.width) - 1));\n"
+                 "        for (uint sy = ty; sy < " + std::to_string(th + 1) + "u; sy += " + std::to_string(wg_y) + "u) {\n"
+                 "            uint srow = uint(clamp(by + int(sy), 0, int(pc.height) - 1)) * pc.src_s;\n"
+                 "            src_u_t[sy][tx] = src_in[srow + sgx];\n"
+                 "        }\n    }\n";
+        }
+        s += "    barrier();\n";
+
+        // Stage 0: Spatial warp-stripe (100% active threads!)
+        s += "    {\n";
+        for (int p = 0; p < py; ++p)
+            for (int og = 0; og < g_mid; ++og)
+                s += "        vec4 q" + std::to_string(p) + "_" + std::to_string(og) + ";\n";
+        s += emit_bias_init_n(g_mid, std::to_string(stages[0].b_uoff) + "u", "q", py, "        ", 10);
+        if (scalar_in) {
+            const int uvec4_per_tap = (g_mid + 1) / 2;
+            for (int ky = 0; ky < 3; ++ky)
+                for (int kx = 0; kx < 3; ++kx) {
+                    s += "        {\n";
+                    for (int p = 0; p < py; ++p)
+                        s += "            float sv" + std::to_string(p) + " = src_t[yl+" + std::to_string(ky + p) + "u][tx+" + std::to_string(kx) + "u];\n";
+                    const int tap = ky * 3 + kx;
+                    for (int og = 0; og < g_mid; og += 2) {
+                        const std::string i2 = std::to_string(stages[0].w_uoff + tap * uvec4_per_tap + og / 2) + "u";
+                        const std::string tg = "s0_" + std::to_string(tap) + "_" + std::to_string(og);
+                        if (og + 1 < g_mid) {
+                            s += "            { NGU_LOAD_PAIR(" + i2 + ", uw_" + tg + ", wa_" + tg + ", wb_" + tg + "); ";
+                            for (int p = 0; p < py; ++p)
+                                s += "NGU_MAC(q" + std::to_string(p) + "_" + std::to_string(og) + ", sv" + std::to_string(p) + ", wa_" + tg + "); ";
+                            for (int p = 0; p < py; ++p)
+                                s += "NGU_MAC(q" + std::to_string(p) + "_" + std::to_string(og + 1) + ", sv" + std::to_string(p) + ", wb_" + tg + "); ";
+                            s += "}\n";
+                        } else {
+                            s += "            { vec4 wa_" + tg + " = NGU_P0(" + i2 + "); ";
+                            for (int p = 0; p < py; ++p)
+                                s += "NGU_MAC(q" + std::to_string(p) + "_" + std::to_string(og) + ", sv" + std::to_string(p) + ", wa_" + tg + "); ";
+                            s += "}\n";
+                        }
+                    }
+                    s += "        }\n";
+                }
+        } else {
+            for (int ky = 0; ky < 3; ++ky)
+                for (int kx = 0; kx < 3; ++kx)
+                    for (int ig = 0; ig < g_in0; ++ig) {
+                        s += "        {\n";
+                        for (int p = 0; p < py; ++p)
+                            s += "            vec4 t" + std::to_string(p) + " = smem[" + std::to_string(ig) + "][yl+" + std::to_string(ky + p) + "u][tx+" + std::to_string(kx) + "u];\n";
+                        const std::uint32_t base = stages[0].w_uoff + static_cast<std::uint32_t>(((ky * 3 + kx) * g_in0 + ig) * (2 * g_mid));
+                        for (int f = 0; f < 4 * g_mid; f += 2) {
+                            const int c0 = f / g_mid, og0 = f % g_mid, c1 = (f + 1) / g_mid, og1 = (f + 1) % g_mid;
+                            const std::string tg = "sp_" + std::to_string(ky) + "_" + std::to_string(kx) + "_" + std::to_string(ig) + "_" + std::to_string(f / 2);
+                            s += "            { NGU_LOAD_PAIR(" + std::to_string(base + f / 2) + "u, u_" + tg + ", wa_" + tg + ", wb_" + tg + "); ";
+                            for (int p = 0; p < py; ++p)
+                                s += "NGU_MAC(q" + std::to_string(p) + "_" + std::to_string(og0) + ", t" + std::to_string(p) + "." + comps[c0] + ", wa_" + tg + "); ";
+                            for (int p = 0; p < py; ++p)
+                                s += "NGU_MAC(q" + std::to_string(p) + "_" + std::to_string(og1) + ", t" + std::to_string(p) + "." + comps[c1] + ", wb_" + tg + "); ";
+                            s += "}\n";
+                        }
+                        s += "        }\n";
+                    }
+            s += "        barrier();\n";
+        }
+        for (int p = 0; p < py; ++p)
+            for (int og = 0; og < g_mid; ++og) {
+                const std::string qn = "q" + std::to_string(p) + "_" + std::to_string(og);
+                s += "        smem[" + std::to_string(og) + "][yl+" + std::to_string(p) + "u][tx] = mix(" + qn + ", " + qn + "*0.1, lessThan(" + qn + ", vec4(0.0)));\n";
+            }
+        s += "        barrier();\n    }\n";
+
+        // Stage 1: ColumnGroupRows warp-stripe
+        if (!(tail_out && !aa))
+            s += "    if (tx >= 30u || uint(bx) + tx >= pc.width) return;\n";
+        const char *pfx = tail_out ? "h" : "p";
+        for (int p = 0; p < py; ++p)
+            for (int og = 0; og < g_last; ++og)
+                s += "    vec4 " + std::string(pfx) + std::to_string(p) + ((g_last == 1) ? "" : ("_" + std::to_string(og))) + ";\n";
+        s += emit_bias_init_n(g_last, std::to_string(stages[1].b_uoff) + "u", pfx, py, "    ", 20) +
+             "    int xl = max(0, 1 - bx), xh = min(31, int(pc.width) - bx);\n"
+             "    int ylo = max(0, 1 - by), yhi = min(" + std::to_string(th + 1) + ", int(pc.height) - by);\n";
+        for (int r = 0; r < py + 2; ++r)
+            s += "    uint ry" + std::to_string(r) + " = uint(clamp(int(yl) + " + std::to_string(r) + ", ylo, yhi));\n";
+        if (full_unr_s1) {
+            for (int kx = 0; kx < 3; ++kx) {
+                s += "    { uint rx = uint(clamp(int(tx) + " + std::to_string(kx) + ", xl, xh));\n";
+                for (int ig = 0; ig < g_mid; ++ig) {
+                    s += "      {\n";
+                    for (int r = 0; r < py + 2; ++r)
+                        s += "        vec4 t" + std::to_string(r) + " = smem[" + std::to_string(ig) + "][ry" + std::to_string(r) + "][rx];\n";
+                    const std::uint32_t base = stages[1].w_uoff + static_cast<std::uint32_t>((kx * g_mid + ig) * (6 * g_last));
+                    for (int ky = 0; ky < 3; ++ky)
+                        for (int f = 0; f < 4 * g_last; f += 2) {
+                            const int c0 = f / g_last, og0 = f % g_last, c1 = (f + 1) / g_last, og1 = (f + 1) % g_last;
+                            const std::string s0 = (g_last == 1) ? "" : ("_" + std::to_string(og0));
+                            const std::string s1 = (g_last == 1) ? "" : ("_" + std::to_string(og1));
+                            const std::string tg = "u1_" + std::to_string(kx) + "_" + std::to_string(ig) + "_" + std::to_string(ky) + "_" + std::to_string(f / 2);
+                            s += "        { NGU_LOAD_PAIR(" + std::to_string(base + ky * 2 * g_last + f / 2) + "u, u_" + tg + ", wa_" + tg + ", wb_" + tg + "); ";
+                            for (int p = 0; p < py; ++p)
+                                s += "NGU_MAC(" + std::string(pfx) + std::to_string(p) + s0 + ", t" + std::to_string(ky + p) + "." + comps[c0] + ", wa_" + tg + "); ";
+                            for (int p = 0; p < py; ++p)
+                                s += "NGU_MAC(" + std::string(pfx) + std::to_string(p) + s1 + ", t" + std::to_string(ky + p) + "." + comps[c1] + ", wb_" + tg + "); ";
+                            s += "}\n";
+                        }
+                    s += "      }\n";
+                }
+                s += "    }\n";
+            }
+        } else {
+            s += "    [[dont_unroll]] for (uint kx = 0u; kx < pc.k3; ++kx) {\n"
+                 "        uint rx = uint(clamp(int(tx + kx), xl, xh));\n"
+                 "        uint kbase = " + std::to_string(stages[1].w_uoff) + "u + kx * " + std::to_string(6 * g_mid * g_last) + "u;\n";
+            for (int ig = 0; ig < g_mid; ++ig) {
+                s += "        {\n";
+                for (int r = 0; r < py + 2; ++r)
+                    s += "            vec4 t" + std::to_string(r) + " = smem[" + std::to_string(ig) + "][ry" + std::to_string(r) + "][rx];\n";
+                for (int ky = 0; ky < 3; ++ky)
+                    for (int f = 0; f < 4 * g_last; f += 2) {
+                        const int c0 = f / g_last, og0 = f % g_last, c1 = (f + 1) / g_last, og1 = (f + 1) % g_last;
+                        const std::string s0 = (g_last == 1) ? "" : ("_" + std::to_string(og0));
+                        const std::string s1 = (g_last == 1) ? "" : ("_" + std::to_string(og1));
+                        const std::string tg = "r1_" + std::to_string(ig) + "_" + std::to_string(ky) + "_" + std::to_string(f / 2);
+                        s += "            { NGU_LOAD_PAIR(kbase + " + std::to_string(ig * 6 * g_last + ky * 2 * g_last + f / 2) + "u, u_" + tg + ", wa_" + tg + ", wb_" + tg + "); ";
+                        for (int p = 0; p < py; ++p)
+                            s += "NGU_MAC(" + std::string(pfx) + std::to_string(p) + s0 + ", t" + std::to_string(ky + p) + "." + comps[c0] + ", wa_" + tg + "); ";
+                        for (int p = 0; p < py; ++p)
+                            s += "NGU_MAC(" + std::string(pfx) + std::to_string(p) + s1 + ", t" + std::to_string(ky + p) + "." + comps[c1] + ", wb_" + tg + "); ";
                         s += "}\n";
                     }
-        s += "        }\n";
-    } else {
-        s += "        for (uint ky = 0u; ky < pc.k3; ++ky) {\n"
-             "            uint ky_off = ky * " + std::to_string(3 * C * G) + "u;\n"
-             "            [[dont_unroll]] for (uint ig = 0u; ig < " + std::to_string(G) + "u; ++ig) {\n"
-             "                vec4 a0=smem[ig][py0+ky][px0+0u], a1=smem[ig][py0+ky][px0+1u], a2=smem[ig][py0+ky][px0+2u], a3=smem[ig][py0+ky][px0+3u];\n"
-             "                vec4 b0s=smem[ig][py0+ky+1u][px0+0u], b1s=smem[ig][py0+ky+1u][px0+1u], b2s=smem[ig][py0+ky+1u][px0+2u], b3s=smem[ig][py0+ky+1u][px0+3u];\n"
-             "                uint base = ky_off + ig * " + std::to_string(4 * G) + "u;\n";
-        for (int kx = 0; kx < 3; ++kx)
-            for (int c = 0; c < 4; ++c)
-                for (int og = 0; og < G; ++og)
-                    s += "                { vec4 w=w0[base+" + std::to_string((kx * C + c) * G + og) + "u]; q00_" +
-                         std::to_string(og) + "+=a" + std::to_string(kx) + "." + comps[c] + "*w; q01_" +
-                         std::to_string(og) + "+=a" + std::to_string(kx + 1) + "." + comps[c] + "*w; q10_" +
-                         std::to_string(og) + "+=b" + std::to_string(kx) + "s." + comps[c] + "*w; q11_" +
-                         std::to_string(og) + "+=b" + std::to_string(kx + 1) + "s." + comps[c] + "*w; }\n";
-        s += "            }\n        }\n";
-    }
-    s += "    }\n    barrier();\n    if (tid < 119u) {\n";
-    for (int og = 0; og < G; ++og)
-        for (int py = 0; py < 2; ++py)
-            for (int px = 0; px < 2; ++px) {
-                const std::string qn = "q" + std::to_string(py) + std::to_string(px) + "_" + std::to_string(og);
-                s += "        smem[" + std::to_string(og) + "][py0+" + std::to_string(py) + "u][px0+" +
-                     std::to_string(px) + "u]=mix(" + qn + "," + qn + "*0.1,lessThan(" + qn + ",vec4(0.0)));\n";
+                s += "        }\n";
             }
-    s += "    }\n    barrier();\n"
-         "    uint x = uint(bx) + tx, y0 = uint(by) + ty * 3u;\n"
-         "    if (x >= pc.width || y0 >= pc.height) return;\n"
-         "    int xl = max(0, 1 - bx), yl_b = max(0, 1 - by), xh = min(33, int(pc.width) - bx), yh_b = min(13, int(pc.height) - by);\n";
-    for (int r = 0; r < 5; ++r)
-        s += "    uint ry" + std::to_string(r) + " = uint(clamp(int(ty * 3u) + " + std::to_string(r) + ", yl_b, yh_b));\n";
-    if (body_only) {
+            s += "    }\n";
+        }
+
+        if (!tail_out) {
+            s += "    uint x = uint(bx) + tx, y0 = uint(by) + yl;\n";
+            for (int p = 0; p < py; ++p) {
+                s += "    if (yl + " + std::to_string(p) + "u < " + std::to_string(th) + "u && y0 + " + std::to_string(p) + "u < pc.height) {\n"
+                     "        uint ob = (y0 + " + std::to_string(p) + "u) * pc.width + x;\n";
+                for (int og = 0; og < g_last; ++og) {
+                    const std::string v = "p" + std::to_string(p) + "_" + std::to_string(og);
+                    s += "        d[" + std::to_string(og) + "u * pc.plane_stride + ob] = mix(" + v + ", " + v + "*0.1, lessThan(" + v + ", vec4(0.0)));\n";
+                }
+                s += "    }\n";
+            }
+        } else {
+            if (!aa) {
+                // Compute horizontal 4-tap into smem[0] after head finishes (saves an extra bx_t shared array!)
+                s += "    barrier();\n"
+                     "    {\n"
+                     "        float ca = uintBitsToFloat(0x3f5f3333u), cb = uintBitsToFloat(0x3e766666u);\n"
+                     "        float cc = uintBitsToFloat(0xbdaccccdu), cd = uintBitsToFloat(0xbce66666u);\n"
+                     "        for (uint sy = ty; sy < " + std::to_string(rows) + "u; sy += " + std::to_string(wg_y) + "u) {\n"
+                     "            float s0=src_t[sy][tx+0u], s1=src_t[sy][tx+1u], s2=src_t[sy][tx+2u], s3=src_t[sy][tx+3u], s4=src_t[sy][tx+4u];\n"
+                     "            smem[0][sy][tx].x = (((cd*s0)+(cb*s1))+(ca*s2))+(cc*s3);\n"
+                     "            smem[0][sy][tx].y = (((cc*s1)+(ca*s2))+(cb*s3))+(cd*s4);\n"
+                     "        }\n    }\n    barrier();\n"
+                     "    if (tx >= 30u || uint(bx) + tx >= pc.width) return;\n";
+            }
+            s += "    uint x = uint(bx) + tx, y0 = uint(by) + yl, ox = x * 2u;\n";
+            if (!aa) {
+                s += "    float ca = uintBitsToFloat(0x3f5f3333u), cb = uintBitsToFloat(0x3e766666u);\n"
+                     "    float cc = uintBitsToFloat(0xbdaccccdu), cd = uintBitsToFloat(0xbce66666u);\n";
+            }
+            for (int p = 0; p < py; ++p) {
+                const std::string hn = "h" + std::to_string(p);
+                s += "    if (yl + " + std::to_string(p) + "u < " + std::to_string(th) + "u && y0 + " + std::to_string(p) + "u < pc.height) {\n"
+                     "        uint ry = yl + " + std::to_string(p) + "u, oy = (y0 + " + std::to_string(p) + "u) * 2u;\n";
+                if (aa) {
+                    s += "        NGU_RAW u00 = src_u_t[ry+0u][tx+0u];\n"
+                         "        float s00 = NGU_FROM_RAW(u00);\n"
+                         "        float s10 = NGU_FROM_RAW(src_u_t[ry+0u][tx+1u]);\n"
+                         "        float s01 = NGU_FROM_RAW(src_u_t[ry+1u][tx+0u]);\n"
+                         "        float s11 = NGU_FROM_RAW(src_u_t[ry+1u][tx+1u]);\n"
+                         "        precise float p10 = (s00 + s10) * 0.5 + " + hn + ".y;\n"
+                         "        precise float p01 = (s00 + s01) * 0.5 + " + hn + ".x;\n"
+                         "        precise float p11 = (((s00 + s10) + s01) + s11) * 0.25 + " + hn + ".z;\n"
+                         "        d[(oy + 0u) * pc.dst_s + ox + 0u] = u00;\n"
+                         "        d[(oy + 0u) * pc.dst_s + ox + 1u] = NGU_TO_RAW(p10);\n"
+                         "        d[(oy + 1u) * pc.dst_s + ox + 0u] = NGU_TO_RAW(p01);\n"
+                         "        d[(oy + 1u) * pc.dst_s + ox + 1u] = NGU_TO_RAW(p11);\n";
+                } else {
+                    s += "        float r0a=smem[0][ry+0u][tx].x, r1a=smem[0][ry+1u][tx].x, r2a=smem[0][ry+2u][tx].x, r3a=smem[0][ry+3u][tx].x, r4a=smem[0][ry+4u][tx].x;\n"
+                         "        float r0b=smem[0][ry+0u][tx].y, r1b=smem[0][ry+1u][tx].y, r2b=smem[0][ry+2u][tx].y, r3b=smem[0][ry+3u][tx].y, r4b=smem[0][ry+4u][tx].y;\n"
+                         "        precise float p00 = ((((cd*r0a)+(cb*r1a))+(ca*r2a))+(cc*r3a)) + " + hn + ".x;\n"
+                         "        precise float p10 = ((((cd*r0b)+(cb*r1b))+(ca*r2b))+(cc*r3b)) + " + hn + ".y;\n"
+                         "        precise float p01 = ((((cc*r1a)+(ca*r2a))+(cb*r3a))+(cd*r4a)) + " + hn + ".z;\n"
+                         "        precise float p11 = ((((cc*r1b)+(ca*r2b))+(cb*r3b))+(cd*r4b)) + " + hn + ".w;\n"
+                         "        d[(oy + 0u) * pc.dst_s + ox + 0u] = p00;\n"
+                         "        d[(oy + 0u) * pc.dst_s + ox + 1u] = p10;\n"
+                         "        d[(oy + 1u) * pc.dst_s + ox + 0u] = p01;\n"
+                         "        d[(oy + 1u) * pc.dst_s + ox + 1u] = p11;\n";
+                }
+                s += "    }\n";
+            }
+        }
+        s += "}\n";
+        return s;
+    }
+
+    // 6. Legacy 2-Stage 32x12 (32.7 KB FP32) retained ONLY for VeryHigh FP32 Pass 1 on strict 32-KB devices.
+    std::string gen_2L_32x12(std::span<const StageDesc> stages, std::uint32_t total_uvec4,
+                             bool aa, bool full_unr_s1, bool alias_bx = false) const {
+        const bool scalar_in = (stages[0].c_in == 1);
+        const bool tail_out = stages[1].is_head;
+        const int g_mid = stages[0].c_out / 4;
+        const int g_last = tail_out ? 1 : (stages[1].c_out / 4);
+        const int g_smem = scalar_in ? g_mid : std::max(stages[0].c_in / 4, g_mid);
+        const char *comps[4] = {"x", "y", "z", "w"};
+
+        std::string s = shader_preamble;
+        s += "layout(local_size_x=32, local_size_y=4, local_size_z=1) in;\n";
+        s += scalar_in
+            ? "layout(set=0, binding=0, std430) readonly buffer Source { float s[]; };\n"
+            : "layout(set=0, binding=0, std430) readonly buffer Source { vec4 s[]; };\n";
+        if (tail_out) {
+            s += aa ? "layout(set=0, binding=1, std430) writeonly buffer Dest4K { NGU_RAW d[]; };\n"
+                    : "layout(set=0, binding=1, std430) writeonly buffer Dest4K { float d[]; };\n";
+        } else {
+            s += "layout(set=0, binding=1, std430) writeonly buffer Dest { vec4 d[]; };\n";
+        }
+        s += "NGU_UBO_DECL(" + std::to_string(total_uvec4 * 2) + ", " + std::to_string(total_uvec4) + ")\n";
+        if (tail_out) {
+            s += aa ? "layout(set=0, binding=3, std430) readonly buffer OrigSrc { NGU_RAW src_in[]; };\n"
+                    : "layout(set=0, binding=3, std430) readonly buffer OrigSrc { float src_in[]; };\n";
+        } else {
+            s += "layout(set=0, binding=3, std430) readonly buffer Aux { float aux_unused[]; };\n";
+        }
+        s += "layout(push_constant, std430) uniform Push { uint width, height, plane_stride, src_s, dst_s, dst_w, dst_h, k3; } pc;\n";
+
+        if (scalar_in) {
+            s += "shared float src_t[16][36];\n"
+                 "shared vec4 smem[" + std::to_string(g_smem) + "][14][34];\n";
+        } else {
+            s += "shared vec4 smem[" + std::to_string(g_smem) + "][16][36];\n";
+            if (tail_out && aa)
+                s += "shared NGU_RAW src_u_t[13][34];\n";
+            else if (tail_out && !alias_bx)
+                s += "shared float src_t[16][36];\nshared float bx_t[16][64];\n";
+        }
+
+        s += "void main() {\n"
+             "    uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y, tid = ty * 32u + tx, yl = ty * 3u;\n"
+             "    int bx = int(gl_WorkGroupID.x) * 32, by = int(gl_WorkGroupID.y) * 12;\n";
+
+        if (scalar_in) {
+            s += "    {\n"
+                 "        uint gx = uint(clamp(bx + int(tx) - 2, 0, int(pc.width) - 1));\n"
+                 "        uint gx_r = uint(clamp(bx + 32 + int(tx) - 2, 0, int(pc.width) - 1));\n"
+                 "        for (uint sy = ty; sy < 16u; sy += 4u) {\n"
+                 "            uint row = uint(clamp(by + int(sy) - 2, 0, int(pc.height) - 1)) * pc.src_s;\n"
+                 "            src_t[sy][tx] = s[row + gx];\n"
+                 "            if (tx < 4u) src_t[sy][32u + tx] = s[row + gx_r];\n"
+                 "        }\n    }\n";
+        } else {
+            const int g_in0 = stages[0].c_in / 4;
+            s += "    {\n"
+                 "        uint gx = uint(clamp(bx + int(tx) - 2, 0, int(pc.width) - 1));\n"
+                 "        uint gx_r = uint(clamp(bx + 32 + int(tx) - 2, 0, int(pc.width) - 1));\n"
+                 "        for (uint sy = ty; sy < 16u; sy += 4u) {\n"
+                 "            uint row = uint(clamp(by + int(sy) - 2, 0, int(pc.height) - 1)) * pc.width;\n"
+                 "            for (int gi = 0; gi < " + std::to_string(g_in0) + "; ++gi) {\n"
+                 "                uint ps = uint(gi) * pc.plane_stride + row;\n"
+                 "                smem[gi][sy][tx] = s[ps + gx];\n"
+                 "                if (tx < 4u) smem[gi][sy][32u + tx] = s[ps + gx_r];\n"
+                 "            }\n";
+            if (tail_out && !aa && !alias_bx) {
+                s += "            uint srow = uint(clamp(by + int(sy) - 2, 0, int(pc.height) - 1)) * pc.src_s;\n"
+                     "            src_t[sy][tx] = src_in[srow + gx];\n"
+                     "            if (tx < 4u) src_t[sy][32u + tx] = src_in[srow + gx_r];\n";
+            }
+            s += "        }\n    }\n";
+            if (tail_out && aa) {
+                s += "    {\n"
+                     "        uint gx = uint(clamp(bx + int(tx), 0, int(pc.width) - 1));\n"
+                     "        uint gx_r = uint(clamp(bx + 32 + int(tx), 0, int(pc.width) - 1));\n"
+                     "        for (uint sy = ty; sy < 13u; sy += 4u) {\n"
+                     "            uint row = uint(clamp(by + int(sy), 0, int(pc.height) - 1)) * pc.src_s;\n"
+                     "            src_u_t[sy][tx] = src_in[row + gx];\n"
+                     "            if (tx < 1u) src_u_t[sy][32u + tx] = src_in[row + gx_r];\n"
+                     "        }\n    }\n";
+            }
+        }
+        s += "    barrier();\n";
+        if (tail_out && !aa && !alias_bx) {
+            s += "    {\n"
+                 "        float ca = uintBitsToFloat(0x3f5f3333u), cb = uintBitsToFloat(0x3e766666u);\n"
+                 "        float cc = uintBitsToFloat(0xbdaccccdu), cd = uintBitsToFloat(0xbce66666u);\n"
+                 "        for (uint sy = ty; sy < 16u; sy += 4u) {\n"
+                 "            float s0=src_t[sy][tx+0u], s1=src_t[sy][tx+1u], s2=src_t[sy][tx+2u], s3=src_t[sy][tx+3u], s4=src_t[sy][tx+4u];\n"
+                 "            bx_t[sy][tx*2u+0u] = (((cd*s0)+(cb*s1))+(ca*s2))+(cc*s3);\n"
+                 "            bx_t[sy][tx*2u+1u] = (((cc*s1)+(ca*s2))+(cb*s3))+(cd*s4);\n"
+                 "        }\n    }\n";
+        }
+
+        // Stage 0: 119 2x2 quads (Spatial)
+        s += "    {\n";
+        for (int p = 0; p < 4; ++p)
+            for (int og = 0; og < g_mid; ++og)
+                s += "        vec4 q" + std::to_string(p) + "_" + std::to_string(og) + " = vec4(0.0);\n";
+        s += "        uint py0 = 0u, px0 = 0u;\n"
+             "        if (tid < 119u) {\n"
+             "            uint qy = tid / 17u, qx = tid - qy * 17u;\n"
+             "            py0 = qy * 2u; px0 = qx * 2u;\n" +
+             emit_bias_init_n(g_mid, std::to_string(stages[0].b_uoff) + "u", "q", 4, "            ", 10);
+        if (scalar_in) {
+            const int uvec4_per_tap = (g_mid + 1) / 2;
+            for (int ky = 0; ky < 3; ++ky) {
+                s += "            {\n"
+                     "                float a0=src_t[py0+" + std::to_string(ky) + "u][px0+0u], a1=src_t[py0+" + std::to_string(ky) + "u][px0+1u], "
+                     "a2=src_t[py0+" + std::to_string(ky) + "u][px0+2u], a3=src_t[py0+" + std::to_string(ky) + "u][px0+3u];\n"
+                     "                float b0s=src_t[py0+" + std::to_string(ky + 1) + "u][px0+0u], b1s=src_t[py0+" + std::to_string(ky + 1) + "u][px0+1u], "
+                     "b2s=src_t[py0+" + std::to_string(ky + 1) + "u][px0+2u], b3s=src_t[py0+" + std::to_string(ky + 1) + "u][px0+3u];\n";
+                for (int kx = 0; kx < 3; ++kx) {
+                    const int tap = ky * 3 + kx;
+                    for (int og = 0; og < g_mid; og += 2) {
+                        const std::string i2 = std::to_string(stages[0].w_uoff + tap * uvec4_per_tap + og / 2) + "u";
+                        const std::string tag = "s0_" + std::to_string(tap) + "_" + std::to_string(og);
+                        if (og + 1 < g_mid) {
+                            s += "                { NGU_LOAD_PAIR(" + i2 + ", uw_" + tag + ", wa_" + tag + ", wb_" + tag + "); "
+                                 "NGU_MAC(q0_" + std::to_string(og) + ", a" + std::to_string(kx) + ", wa_" + tag + "); "
+                                 "NGU_MAC(q1_" + std::to_string(og) + ", a" + std::to_string(kx + 1) + ", wa_" + tag + "); "
+                                 "NGU_MAC(q2_" + std::to_string(og) + ", b" + std::to_string(kx) + "s, wa_" + tag + "); "
+                                 "NGU_MAC(q3_" + std::to_string(og) + ", b" + std::to_string(kx + 1) + "s, wa_" + tag + "); "
+                                 "NGU_MAC(q0_" + std::to_string(og + 1) + ", a" + std::to_string(kx) + ", wb_" + tag + "); "
+                                 "NGU_MAC(q1_" + std::to_string(og + 1) + ", a" + std::to_string(kx + 1) + ", wb_" + tag + "); "
+                                 "NGU_MAC(q2_" + std::to_string(og + 1) + ", b" + std::to_string(kx) + "s, wb_" + tag + "); "
+                                 "NGU_MAC(q3_" + std::to_string(og + 1) + ", b" + std::to_string(kx + 1) + "s, wb_" + tag + "); }\n";
+                        } else {
+                            s += "                { vec4 wa_" + tag + " = NGU_P0(" + i2 + "); "
+                                 "NGU_MAC(q0_" + std::to_string(og) + ", a" + std::to_string(kx) + ", wa_" + tag + "); "
+                                 "NGU_MAC(q1_" + std::to_string(og) + ", a" + std::to_string(kx + 1) + ", wa_" + tag + "); "
+                                 "NGU_MAC(q2_" + std::to_string(og) + ", b" + std::to_string(kx) + "s, wa_" + tag + "); "
+                                 "NGU_MAC(q3_" + std::to_string(og) + ", b" + std::to_string(kx + 1) + "s, wa_" + tag + "); }\n";
+                        }
+                    }
+                }
+                s += "            }\n";
+            }
+        } else {
+            const int g_in0 = stages[0].c_in / 4;
+            // Keep ig rolled when FP32 G>=3 so SASS stays < 28 KB inside L1I cache!
+            if (half && g_in0 <= 3) {
+                s += "            uint u_idx = " + std::to_string(stages[0].w_uoff) + "u;\n"
+                     "            [[dont_unroll]] for (uint ky = 0u; ky < pc.k3; ++ky) {\n";
+                for (int ig = 0; ig < g_in0; ++ig)
+                    for (int row = 0; row < 2; ++row)
+                        for (int col = 0; col < 4; ++col)
+                            s += "                vec4 t" + std::to_string(ig) + "_" + std::to_string(row) + "_" + std::to_string(col) +
+                                 " = smem[" + std::to_string(ig) + "][py0+ky+" + std::to_string(row) + "u][px0+" + std::to_string(col) + "u];\n";
+                for (int kx = 0; kx < 3; ++kx)
+                    for (int ig = 0; ig < g_in0; ++ig)
+                        for (int f = 0; f < 4 * g_mid; f += 2) {
+                            const int c0 = f / g_mid, og0 = f % g_mid, c1 = (f + 1) / g_mid, og1 = (f + 1) % g_mid;
+                            const int u_loc = (kx * g_in0 + ig) * (2 * g_mid) + f / 2;
+                            const std::string tag = "hq_" + std::to_string(kx) + "_" + std::to_string(ig) + "_" + std::to_string(f / 2);
+                            const std::string ta0 = "t" + std::to_string(ig) + "_0_" + std::to_string(kx);
+                            const std::string tb0 = "t" + std::to_string(ig) + "_0_" + std::to_string(kx + 1);
+                            const std::string ta1 = "t" + std::to_string(ig) + "_1_" + std::to_string(kx);
+                            const std::string tb1 = "t" + std::to_string(ig) + "_1_" + std::to_string(kx + 1);
+                            s += "                { NGU_LOAD_PAIR(u_idx + " + std::to_string(u_loc) + "u, uw_" + tag + ", wa_" + tag + ", wb_" + tag + "); "
+                                 "NGU_MAC(q0_" + std::to_string(og0) + ", " + ta0 + "." + comps[c0] + ", wa_" + tag + "); "
+                                 "NGU_MAC(q1_" + std::to_string(og0) + ", " + tb0 + "." + comps[c0] + ", wa_" + tag + "); "
+                                 "NGU_MAC(q2_" + std::to_string(og0) + ", " + ta1 + "." + comps[c0] + ", wa_" + tag + "); "
+                                 "NGU_MAC(q3_" + std::to_string(og0) + ", " + tb1 + "." + comps[c0] + ", wa_" + tag + "); "
+                                 "NGU_MAC(q0_" + std::to_string(og1) + ", " + ta0 + "." + comps[c1] + ", wb_" + tag + "); "
+                                 "NGU_MAC(q1_" + std::to_string(og1) + ", " + tb0 + "." + comps[c1] + ", wb_" + tag + "); "
+                                 "NGU_MAC(q2_" + std::to_string(og1) + ", " + ta1 + "." + comps[c1] + ", wb_" + tag + "); "
+                                 "NGU_MAC(q3_" + std::to_string(og1) + ", " + tb1 + "." + comps[c1] + ", wb_" + tag + "); }\n";
+                        }
+                s += "                u_idx += " + std::to_string(6 * g_in0 * g_mid) + "u;\n"
+                     "            }\n";
+            } else {
+                s += "            for (uint ky = 0u; ky < pc.k3; ++ky) {\n"
+                     "                [[dont_unroll]] for (uint ig = 0u; ig < " + std::to_string(g_in0) + "u; ++ig) {\n"
+                     "                    vec4 a0=smem[ig][py0+ky][px0+0u], a1=smem[ig][py0+ky][px0+1u], a2=smem[ig][py0+ky][px0+2u], a3=smem[ig][py0+ky][px0+3u];\n"
+                     "                    vec4 b0s=smem[ig][py0+ky+1u][px0+0u], b1s=smem[ig][py0+ky+1u][px0+1u], b2s=smem[ig][py0+ky+1u][px0+2u], b3s=smem[ig][py0+ky+1u][px0+3u];\n"
+                     "                    uint base = " + std::to_string(stages[0].w_uoff) + "u + ky * " + std::to_string(6 * g_in0 * g_mid) + "u + ig * " + std::to_string(2 * g_mid) + "u;\n";
+                for (int kx = 0; kx < 3; ++kx)
+                    for (int f = 0; f < 4 * g_mid; f += 2) {
+                        const int c0 = f / g_mid, og0 = f % g_mid, c1 = (f + 1) / g_mid, og1 = (f + 1) % g_mid;
+                        const int u_loc = kx * g_in0 * 2 * g_mid + f / 2;
+                        const std::string tag = "fq_" + std::to_string(kx) + "_" + std::to_string(f / 2);
+                        s += "                    { NGU_LOAD_PAIR(base + " + std::to_string(u_loc) + "u, uw_" + tag + ", wa_" + tag + ", wb_" + tag + "); "
+                             "NGU_MAC(q0_" + std::to_string(og0) + ", a" + std::to_string(kx) + "." + comps[c0] + ", wa_" + tag + "); "
+                             "NGU_MAC(q1_" + std::to_string(og0) + ", a" + std::to_string(kx + 1) + "." + comps[c0] + ", wa_" + tag + "); "
+                             "NGU_MAC(q2_" + std::to_string(og0) + ", b" + std::to_string(kx) + "s." + comps[c0] + ", wa_" + tag + "); "
+                             "NGU_MAC(q3_" + std::to_string(og0) + ", b" + std::to_string(kx + 1) + "s." + comps[c0] + ", wa_" + tag + "); "
+                             "NGU_MAC(q0_" + std::to_string(og1) + ", a" + std::to_string(kx) + "." + comps[c1] + ", wb_" + tag + "); "
+                             "NGU_MAC(q1_" + std::to_string(og1) + ", " + "a" + std::to_string(kx + 1) + "." + comps[c1] + ", wb_" + tag + "); "
+                             "NGU_MAC(q2_" + std::to_string(og1) + ", b" + std::to_string(kx) + "s." + comps[c1] + ", wb_" + tag + "); "
+                             "NGU_MAC(q3_" + std::to_string(og1) + ", b" + std::to_string(kx + 1) + "s." + comps[c1] + ", wb_" + tag + "); }\n";
+                    }
+                s += "                }\n            }\n";
+            }
+        }
+        s += "        }\n";
+        if (!scalar_in)
+            s += "        barrier();\n";
+        s += "        if (tid < 119u) {\n";
+        for (int og = 0; og < g_mid; ++og) {
+            const std::string ogs = std::to_string(og);
+            s += "            smem[" + ogs + "][py0+0u][px0+0u] = mix(q0_" + ogs + ", q0_" + ogs + "*0.1, lessThan(q0_" + ogs + ", vec4(0.0)));\n"
+                 "            smem[" + ogs + "][py0+0u][px0+1u] = mix(q1_" + ogs + ", q1_" + ogs + "*0.1, lessThan(q1_" + ogs + ", vec4(0.0)));\n"
+                 "            smem[" + ogs + "][py0+1u][px0+0u] = mix(q2_" + ogs + ", q2_" + ogs + "*0.1, lessThan(q2_" + ogs + ", vec4(0.0)));\n"
+                 "            smem[" + ogs + "][py0+1u][px0+1u] = mix(q3_" + ogs + ", q3_" + ogs + "*0.1, lessThan(q3_" + ogs + ", vec4(0.0)));\n";
+        }
+        s += "        }\n        barrier();\n    }\n";
+
+        // Stage 1: 32x12 3py (ColumnGroupRows)
+        const char *pfx = tail_out ? "h" : "p";
+        if (!alias_bx) {
+            s += "    if (uint(bx) + tx >= pc.width || uint(by) + yl >= pc.height) return;\n";
+        }
         s += "    {\n";
         for (int p = 0; p < 3; ++p)
-            for (int og = 0; og < G; ++og)
-                s += "        vec4 p" + std::to_string(p) + "_" + std::to_string(og) + "=bh[" + std::to_string(og) + "];\n";
-        s += emit_nc4_3py_loop("wh", "smem", "p", C, 0, G, G, true, true);
-        for (int p = 0; p < 3; ++p) {
-            const auto n = std::to_string(p);
-            s += "        if (y0+" + n + "u<pc.height) {\n";
-            for (int og = 0; og < G; ++og) {
-                const auto v = "p" + n + "_" + std::to_string(og);
-                s += "            d[" + std::to_string(og) + "u*pc.plane_stride+(y0+" + n + "u)*pc.width+x]=mix(" +
-                     v + "," + v + "*0.1,lessThan(" + v + ",vec4(0.0)));\n";
+            for (int og = 0; og < g_last; ++og)
+                s += "        vec4 " + std::string(pfx) + std::to_string(p) + ((g_last == 1) ? "" : ("_" + std::to_string(og))) + ";\n";
+        s += emit_bias_init_n(g_last, std::to_string(stages[1].b_uoff) + "u", pfx, 3, "        ", 20) +
+             "        int xl = max(0, 1 - bx), xh = min(33, int(pc.width) - bx);\n"
+             "        int ylo = max(0, 1 - by), yhi = min(13, int(pc.height) - by);\n"
+             "        uint ry0=uint(clamp(int(yl)+0,ylo,yhi)), ry1=uint(clamp(int(yl)+1,ylo,yhi)), "
+             "ry2=uint(clamp(int(yl)+2,ylo,yhi)), ry3=uint(clamp(int(yl)+3,ylo,yhi)), ry4=uint(clamp(int(yl)+4,ylo,yhi));\n";
+        if (full_unr_s1) {
+            for (int kx = 0; kx < 3; ++kx) {
+                s += "        uint rx_" + std::to_string(kx) + " = uint(clamp(int(tx) + " + std::to_string(kx) + ", xl, xh));\n";
+                for (int ig = 0; ig < g_mid; ++ig) {
+                    s += "        {\n";
+                    for (int r = 0; r < 5; ++r)
+                        s += "            vec4 t" + std::to_string(r) + " = smem[" + std::to_string(ig) + "][ry" + std::to_string(r) + "][rx_" + std::to_string(kx) + "];\n";
+                    const std::uint32_t base = stages[1].w_uoff + static_cast<std::uint32_t>((kx * g_mid + ig) * (6 * g_last));
+                    for (int ky = 0; ky < 3; ++ky)
+                        for (int f = 0; f < 4 * g_last; f += 2) {
+                            const int c0 = f / g_last, og0 = f % g_last, c1 = (f + 1) / g_last, og1 = (f + 1) % g_last;
+                            const std::string s0 = (g_last == 1) ? "" : ("_" + std::to_string(og0));
+                            const std::string s1 = (g_last == 1) ? "" : ("_" + std::to_string(og1));
+                            const std::string tg = "u1_" + std::to_string(kx) + "_" + std::to_string(ig) + "_" + std::to_string(ky) + "_" + std::to_string(f / 2);
+                            s += "            { NGU_LOAD_PAIR(" + std::to_string(base + ky * 2 * g_last + f / 2) + "u, u_" + tg + ", wa_" + tg + ", wb_" + tg + "); "
+                                 "NGU_MAC(" + pfx + "0" + s0 + ", t" + std::to_string(ky) + "." + comps[c0] + ", wa_" + tg + "); "
+                                 "NGU_MAC(" + pfx + "1" + s0 + ", t" + std::to_string(ky + 1) + "." + comps[c0] + ", wa_" + tg + "); "
+                                 "NGU_MAC(" + pfx + "2" + s0 + ", t" + std::to_string(ky + 2) + "." + comps[c0] + ", wa_" + tg + "); "
+                                 "NGU_MAC(" + pfx + "0" + s1 + ", t" + std::to_string(ky) + "." + comps[c1] + ", wb_" + tg + "); "
+                                 "NGU_MAC(" + pfx + "1" + s1 + ", t" + std::to_string(ky + 1) + "." + comps[c1] + ", wb_" + tg + "); "
+                                 "NGU_MAC(" + pfx + "2" + s1 + ", t" + std::to_string(ky + 2) + "." + comps[c1] + ", wb_" + tg + "); }\n";
+                        }
+                    s += "        }\n";
+                }
             }
-            s += "        }\n";
+        } else {
+            s += "        for (uint kx = 0u; kx < pc.k3; ++kx) {\n"
+                 "            uint rx = uint(clamp(int(tx + kx), xl, xh));\n"
+                 "            [[dont_unroll]] for (uint ig = 0u; ig < " + std::to_string(g_mid) + "u; ++ig) {\n"
+                 "                vec4 t0=smem[ig][ry0][rx], t1=smem[ig][ry1][rx], t2=smem[ig][ry2][rx], t3=smem[ig][ry3][rx], t4=smem[ig][ry4][rx];\n"
+                 "                uint base = " + std::to_string(stages[1].w_uoff) + "u + (kx * " + std::to_string(g_mid) + "u + ig) * " + std::to_string(6 * g_last) + "u;\n";
+            for (int ky = 0; ky < 3; ++ky)
+                for (int f = 0; f < 4 * g_last; f += 2) {
+                    const int c0 = f / g_last, og0 = f % g_last, c1 = (f + 1) / g_last, og1 = (f + 1) % g_last;
+                    const std::string s0 = (g_last == 1) ? "" : ("_" + std::to_string(og0));
+                    const std::string s1 = (g_last == 1) ? "" : ("_" + std::to_string(og1));
+                    const std::string tg = "r1_" + std::to_string(ky) + "_" + std::to_string(f / 2);
+                    s += "                { NGU_LOAD_PAIR(base + " + std::to_string(ky * 2 * g_last + f / 2) + "u, u_" + tg + ", wa_" + tg + ", wb_" + tg + "); "
+                         "NGU_MAC(" + pfx + "0" + s0 + ", t" + std::to_string(ky) + "." + comps[c0] + ", wa_" + tg + "); "
+                         "NGU_MAC(" + pfx + "1" + s0 + ", t" + std::to_string(ky + 1) + "." + comps[c0] + ", wa_" + tg + "); "
+                         "NGU_MAC(" + pfx + "2" + s0 + ", t" + std::to_string(ky + 2) + "." + comps[c0] + ", wa_" + tg + "); "
+                         "NGU_MAC(" + pfx + "0" + s1 + ", t" + std::to_string(ky) + "." + comps[c1] + ", wb_" + tg + "); "
+                         "NGU_MAC(" + pfx + "1" + s1 + ", t" + std::to_string(ky + 1) + "." + comps[c1] + ", wb_" + tg + "); "
+                         "NGU_MAC(" + pfx + "2" + s1 + ", t" + std::to_string(ky + 2) + "." + comps[c1] + ", wb_" + tg + "); }\n";
+                }
+            s += "            }\n        }\n";
+        }
+
+        if (!tail_out) {
+            s += "        uint x = uint(bx) + tx, y0 = uint(by) + yl;\n";
+            for (int p = 0; p < 3; ++p) {
+                if (p > 0) s += "        if (y0 + " + std::to_string(p) + "u < pc.height) {\n";
+                s += "        { uint ob = (y0 + " + std::to_string(p) + "u) * pc.width + x;\n";
+                for (int og = 0; og < g_last; ++og) {
+                    const std::string v = "p" + std::to_string(p) + "_" + std::to_string(og);
+                    s += "          d[" + std::to_string(og) + "u * pc.plane_stride + ob] = mix(" + v + ", " + v + "*0.1, lessThan(" + v + ", vec4(0.0)));\n";
+                }
+                s += "        }\n";
+                if (p > 0) s += "        }\n";
+            }
+        } else {
+            if (!aa && alias_bx) {
+                s += "        barrier();\n"
+                     "        {\n"
+                     "            uint gx = uint(clamp(bx + int(tx) - 2, 0, int(pc.width) - 1));\n"
+                     "            uint gx_r = uint(clamp(bx + 32 + int(tx) - 2, 0, int(pc.width) - 1));\n"
+                     "            for (uint sy = ty; sy < 16u; sy += 4u) {\n"
+                     "                uint row = uint(clamp(by + int(sy) - 2, 0, int(pc.height) - 1)) * pc.src_s;\n"
+                     "                smem[0][sy][tx].x = src_in[row + gx];\n"
+                     "                if (tx < 4u) smem[0][sy][32u + tx].x = src_in[row + gx_r];\n"
+                     "            }\n        }\n        barrier();\n"
+                     "        {\n"
+                     "            float ca = uintBitsToFloat(0x3f5f3333u), cb = uintBitsToFloat(0x3e766666u);\n"
+                     "            float cc = uintBitsToFloat(0xbdaccccdu), cd = uintBitsToFloat(0xbce66666u);\n"
+                     "            for (uint sy = ty; sy < 16u; sy += 4u) {\n"
+                     "                float s0=smem[0][sy][tx+0u].x, s1=smem[0][sy][tx+1u].x, s2=smem[0][sy][tx+2u].x, s3=smem[0][sy][tx+3u].x, s4=smem[0][sy][tx+4u].x;\n"
+                     "                smem[1][sy][tx].x = (((cd*s0)+(cb*s1))+(ca*s2))+(cc*s3);\n"
+                     "                smem[1][sy][tx].y = (((cc*s1)+(ca*s2))+(cb*s3))+(cd*s4);\n"
+                     "            }\n        }\n        barrier();\n"
+                     "        if (uint(bx) + tx >= pc.width || uint(by) + yl >= pc.height) return;\n";
+            }
+            s += "        uint x = uint(bx) + tx, y0 = uint(by) + yl, ox = x * 2u, c0 = tx * 2u;\n";
+            if (!aa) {
+                s += "        float ca = uintBitsToFloat(0x3f5f3333u), cb = uintBitsToFloat(0x3e766666u);\n"
+                     "        float cc = uintBitsToFloat(0xbdaccccdu), cd = uintBitsToFloat(0xbce66666u);\n";
+            }
+            for (int p = 0; p < 3; ++p) {
+                const std::string hn = "h" + std::to_string(p);
+                if (p > 0) s += "        if (y0 + " + std::to_string(p) + "u < pc.height) {\n";
+                s += "        { uint ry = yl + " + std::to_string(p) + "u, oy = (y0 + " + std::to_string(p) + "u) * 2u;\n";
+                if (aa) {
+                    s += "          NGU_RAW u00 = src_u_t[ry+0u][tx+0u];\n"
+                         "          float s00 = NGU_FROM_RAW(u00);\n"
+                         "          float s10 = NGU_FROM_RAW(src_u_t[ry+0u][tx+1u]);\n"
+                         "          float s01 = NGU_FROM_RAW(src_u_t[ry+1u][tx+0u]);\n"
+                         "          float s11 = NGU_FROM_RAW(src_u_t[ry+1u][tx+1u]);\n"
+                         "          precise float p10 = (s00 + s10) * 0.5 + " + hn + ".y;\n"
+                         "          precise float p01 = (s00 + s01) * 0.5 + " + hn + ".x;\n"
+                         "          precise float p11 = (((s00 + s10) + s01) + s11) * 0.25 + " + hn + ".z;\n"
+                         "          d[(oy + 0u) * pc.dst_s + ox + 0u] = u00;\n"
+                         "          d[(oy + 0u) * pc.dst_s + ox + 1u] = NGU_TO_RAW(p10);\n"
+                         "          d[(oy + 1u) * pc.dst_s + ox + 0u] = NGU_TO_RAW(p01);\n"
+                         "          d[(oy + 1u) * pc.dst_s + ox + 1u] = NGU_TO_RAW(p11);\n";
+                } else if (alias_bx) {
+                    s += "          float r0a=smem[1][ry+0u][tx].x, r1a=smem[1][ry+1u][tx].x, r2a=smem[1][ry+2u][tx].x, r3a=smem[1][ry+3u][tx].x, r4a=smem[1][ry+4u][tx].x;\n"
+                         "          float r0b=smem[1][ry+0u][tx].y, r1b=smem[1][ry+1u][tx].y, r2b=smem[1][ry+2u][tx].y, r3b=smem[1][ry+3u][tx].y, r4b=smem[1][ry+4u][tx].y;\n"
+                         "          precise float p00 = ((((cd*r0a)+(cb*r1a))+(ca*r2a))+(cc*r3a)) + " + hn + ".x;\n"
+                         "          precise float p10 = ((((cd*r0b)+(cb*r1b))+(ca*r2b))+(cc*r3b)) + " + hn + ".y;\n"
+                         "          precise float p01 = ((((cc*r1a)+(ca*r2a))+(cb*r3a))+(cd*r4a)) + " + hn + ".z;\n"
+                         "          precise float p11 = ((((cc*r1b)+(ca*r2b))+(cb*r3b))+(cd*r4b)) + " + hn + ".w;\n"
+                         "          d[(oy + 0u) * pc.dst_s + ox + 0u] = p00;\n"
+                         "          d[(oy + 0u) * pc.dst_s + ox + 1u] = p10;\n"
+                         "          d[(oy + 1u) * pc.dst_s + ox + 0u] = p01;\n"
+                         "          d[(oy + 1u) * pc.dst_s + ox + 1u] = p11;\n";
+                } else {
+                    s += "          float r0a=bx_t[ry+0u][c0], r1a=bx_t[ry+1u][c0], r2a=bx_t[ry+2u][c0], r3a=bx_t[ry+3u][c0], r4a=bx_t[ry+4u][c0];\n"
+                         "          float r0b=bx_t[ry+0u][c0+1u], r1b=bx_t[ry+1u][c0+1u], r2b=bx_t[ry+2u][c0+1u], r3b=bx_t[ry+3u][c0+1u], r4b=bx_t[ry+4u][c0+1u];\n"
+                         "          precise float p00 = ((((cd*r0a)+(cb*r1a))+(ca*r2a))+(cc*r3a)) + " + hn + ".x;\n"
+                         "          precise float p10 = ((((cd*r0b)+(cb*r1b))+(ca*r2b))+(cc*r3b)) + " + hn + ".y;\n"
+                         "          precise float p01 = ((((cc*r1a)+(ca*r2a))+(cb*r3a))+(cd*r4a)) + " + hn + ".z;\n"
+                         "          precise float p11 = ((((cc*r1b)+(ca*r2b))+(cb*r3b))+(cd*r4b)) + " + hn + ".w;\n"
+                         "          d[(oy + 0u) * pc.dst_s + ox + 0u] = p00;\n"
+                         "          d[(oy + 0u) * pc.dst_s + ox + 1u] = p10;\n"
+                         "          d[(oy + 1u) * pc.dst_s + ox + 0u] = p01;\n"
+                         "          d[(oy + 1u) * pc.dst_s + ox + 1u] = p11;\n";
+                }
+                s += "        }\n";
+                if (p > 0) s += "        }\n";
+            }
         }
         s += "    }\n}\n";
-    } else {
-        s += "    {\n        vec4 h0 = bh[0], h1 = h0, h2 = h0;\n" +
-             emit_nc4_3py_loop("wh", "smem", "h", C, 0, 1, 1, true, true) +
-             emit_3py_head_combine_and_store(aa, 0) +
-             "    }\n}\n";
+        return s;
     }
-    return s;
-}
+
+    // Compact 32-KB fallback for Low FP32 on strict 32-KB devices (< 41.8 KB smem)
+    std::string gen_low_32kb(std::span<const StageDesc> stages, std::uint32_t total_uvec4, bool aa) const {
+        const char *comps[4] = {"x", "y", "z", "w"};
+        std::string s = shader_preamble;
+        s += "layout(local_size_x=16, local_size_y=16, local_size_z=1) in;\n";
+        s += aa ? "layout(set=0, binding=0, std430) readonly buffer Source { NGU_RAW s[]; };\n"
+                  "layout(set=0, binding=1, std430) writeonly buffer Dest4K { NGU_RAW d[]; };\n"
+                : "layout(set=0, binding=0, std430) readonly buffer Source { float s[]; };\n"
+                  "layout(set=0, binding=1, std430) writeonly buffer Dest4K { float d[]; };\n";
+        s += "NGU_UBO_DECL(" + std::to_string(total_uvec4 * 2) + ", " + std::to_string(total_uvec4) + ")\n"
+             "layout(set=0, binding=3, std430) readonly buffer Aux { float aux_unused[]; };\n"
+             "layout(push_constant, std430) uniform Push { uint width, height, plane_stride, src_s, dst_s, dst_w, dst_h, k3; } pc;\n";
+        s += aa ? "shared NGU_RAW src_t[22][22];\n" : "shared float src_t[22][22];\n";
+        s += "shared vec4 tile[2][20][20];\n"
+             "void main() {\n"
+             "    uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y, tid = ty * 16u + tx;\n"
+             "    int bx = int(gl_WorkGroupID.x) * 14, by = int(gl_WorkGroupID.y) * 14;\n"
+             "    for (uint idx = tid; idx < 484u; idx += 256u) {\n"
+             "        uint ly = idx / 22u, lx = idx - ly * 22u;\n"
+             "        src_t[ly][lx] = s[uint(clamp(by + int(ly) - 4, 0, int(pc.height) - 1)) * pc.src_s + uint(clamp(bx + int(lx) - 4, 0, int(pc.width) - 1))];\n"
+             "    }\n    barrier();\n"
+             "    uint py0 = ty * 2u, px0 = tx * 2u;\n";
+        const std::string rd_pre = aa ? "NGU_FROM_RAW(src_t" : "src_t";
+        const std::string rd_post = aa ? ")" : "";
+        s += "    if (tx < 10u && ty < 10u) {\n"
+             "        vec4 q0_0, q0_1, q1_0, q1_1, q2_0, q2_1, q3_0, q3_1;\n" +
+             emit_bias_init_n(2, std::to_string(stages[0].b_uoff) + "u", "q", 4, "        ", 0);
+        for (int ky = 0; ky < 3; ++ky)
+            for (int kx = 0; kx < 3; ++kx) {
+                const std::string i2 = std::to_string(stages[0].w_uoff + ky * 3 + kx) + "u";
+                const std::string tag = "c0_" + std::to_string(ky * 3 + kx);
+                s += "        { NGU_LOAD_PAIR(" + i2 + ", uw_" + tag + ", wa_" + tag + ", wb_" + tag + "); "
+                     "float a0=" + rd_pre + "[py0+" + std::to_string(ky) + "u][px0+" + std::to_string(kx) + "u]" + rd_post + ", "
+                     "a1=" + rd_pre + "[py0+" + std::to_string(ky) + "u][px0+" + std::to_string(kx + 1) + "u]" + rd_post + ", "
+                     "b0s=" + rd_pre + "[py0+" + std::to_string(ky + 1) + "u][px0+" + std::to_string(kx) + "u]" + rd_post + ", "
+                     "b1s=" + rd_pre + "[py0+" + std::to_string(ky + 1) + "u][px0+" + std::to_string(kx + 1) + "u]" + rd_post + "; "
+                     "NGU_MAC(q0_0, a0, wa_" + tag + "); NGU_MAC(q1_0, a1, wa_" + tag + "); NGU_MAC(q2_0, b0s, wa_" + tag + "); NGU_MAC(q3_0, b1s, wa_" + tag + "); "
+                     "NGU_MAC(q0_1, a0, wb_" + tag + "); NGU_MAC(q1_1, a1, wb_" + tag + "); NGU_MAC(q2_1, b0s, wb_" + tag + "); NGU_MAC(q3_1, b1s, wb_" + tag + "); }\n";
+            }
+        for (int og = 0; og < 2; ++og) {
+            const std::string ogs = std::to_string(og);
+            s += "        tile[" + ogs + "][py0+0u][px0+0u]=mix(q0_" + ogs + ",q0_" + ogs + "*0.1,lessThan(q0_" + ogs + ",vec4(0.0)));\n"
+                 "        tile[" + ogs + "][py0+0u][px0+1u]=mix(q1_" + ogs + ",q1_" + ogs + "*0.1,lessThan(q1_" + ogs + ",vec4(0.0)));\n"
+                 "        tile[" + ogs + "][py0+1u][px0+0u]=mix(q2_" + ogs + ",q2_" + ogs + "*0.1,lessThan(q2_" + ogs + ",vec4(0.0)));\n"
+                 "        tile[" + ogs + "][py0+1u][px0+1u]=mix(q3_" + ogs + ",q3_" + ogs + "*0.1,lessThan(q3_" + ogs + ",vec4(0.0)));\n";
+        }
+        s += "    }\n    barrier();\n";
+        const std::uint32_t w_stride = stages[2].w_uoff - stages[1].w_uoff;
+        const std::uint32_t b_stride = stages[2].b_uoff - stages[1].b_uoff;
+        s += "    [[dont_unroll]] for (uint stg = 0u; stg < 2u; ++stg) {\n"
+             "        uint q_dim = 9u - stg;\n"
+             "        int pad = 3 - int(stg), max_in = 19 - int(stg) * 2;\n"
+             "        vec4 q0_0=vec4(0.0),q0_1=vec4(0.0),q1_0=vec4(0.0),q1_1=vec4(0.0),q2_0=vec4(0.0),q2_1=vec4(0.0),q3_0=vec4(0.0),q3_1=vec4(0.0);\n"
+             "        if (tx < q_dim && ty < q_dim) {\n"
+             "            int xl=max(0,pad-bx),xh=min(max_in,int(pc.width)-1+pad-bx),ylo=max(0,pad-by),yhi=min(max_in,int(pc.height)-1+pad-by);\n" +
+             emit_bias_init_n(2, std::to_string(stages[1].b_uoff) + "u + stg * " + std::to_string(b_stride) + "u", "q", 4, "            ", 1) +
+             "            uint u_idx = " + std::to_string(stages[1].w_uoff) + "u + stg * " + std::to_string(w_stride) + "u;\n"
+             "            for (uint ky=0u; ky<pc.k3; ++ky) for (uint kx=0u; kx<pc.k3; ++kx) for (uint ig=0u; ig<2u; ++ig) {\n"
+             "                uint ry0=uint(clamp(int(py0+ky)+0,ylo,yhi)),ry1=uint(clamp(int(py0+ky)+1,ylo,yhi));\n"
+             "                uint rx0=uint(clamp(int(px0+kx)+0,xl,xh)),rx1=uint(clamp(int(px0+kx)+1,xl,xh));\n"
+             "                vec4 a0=tile[ig][ry0][rx0],b0s=tile[ig][ry0][rx1],a1=tile[ig][ry1][rx0],b1s=tile[ig][ry1][rx1];\n";
+        for (int c = 0; c < 4; ++c) {
+            const std::string tag = "cl_" + std::to_string(c);
+            s += "                { NGU_LOAD_PAIR(u_idx + " + std::to_string(c) + "u, uw_" + tag + ", wa_" + tag + ", wb_" + tag + "); "
+                 "NGU_MAC(q0_0,a0." + comps[c] + ",wa_" + tag + "); NGU_MAC(q1_0,b0s." + comps[c] + ",wa_" + tag + "); NGU_MAC(q2_0,a1." + comps[c] + ",wa_" + tag + "); NGU_MAC(q3_0,b1s." + comps[c] + ",wa_" + tag + "); "
+                 "NGU_MAC(q0_1,a0." + comps[c] + ",wb_" + tag + "); NGU_MAC(q1_1,b0s." + comps[c] + ",wb_" + tag + "); NGU_MAC(q2_1,a1." + comps[c] + ",wb_" + tag + "); NGU_MAC(q3_1,b1s." + comps[c] + ",wb_" + tag + "); }\n";
+        }
+        s += "                u_idx += 4u;\n            }\n        }\n        barrier();\n"
+             "        if (tx < q_dim && ty < q_dim) {\n";
+        for (int og = 0; og < 2; ++og) {
+            const std::string ogs = std::to_string(og);
+            s += "            tile[" + ogs + "][py0+0u][px0+0u]=mix(q0_" + ogs + ",q0_" + ogs + "*0.1,lessThan(q0_" + ogs + ",vec4(0.0)));\n"
+                 "            tile[" + ogs + "][py0+0u][px0+1u]=mix(q1_" + ogs + ",q1_" + ogs + "*0.1,lessThan(q1_" + ogs + ",vec4(0.0)));\n"
+                 "            tile[" + ogs + "][py0+1u][px0+0u]=mix(q2_" + ogs + ",q2_" + ogs + "*0.1,lessThan(q2_" + ogs + ",vec4(0.0)));\n"
+                 "            tile[" + ogs + "][py0+1u][px0+1u]=mix(q3_" + ogs + ",q3_" + ogs + "*0.1,lessThan(q3_" + ogs + ",vec4(0.0)));\n";
+        }
+        s += "        }\n        barrier();\n    }\n"
+             "    vec4 hsum = vec4(0.0);\n"
+             "    if (tx < 14u && ty < 14u) {\n"
+             "        int xl=max(0,1-bx),xh=min(15,int(pc.width)-bx),ylo=max(0,1-by),yhi=min(15,int(pc.height)-by);\n" +
+             emit_bias_init_n(1, std::to_string(stages[3].b_uoff) + "u", "hsum_tmp", 1, "        ", 9) +
+             "        hsum = hsum_tmp0;\n"
+             "        uint u_idx = " + std::to_string(stages[3].w_uoff) + "u;\n"
+             "        for (uint ky=0u; ky<pc.k3; ++ky) for (uint kx=0u; kx<pc.k3; ++kx) for (uint ig=0u; ig<2u; ++ig) {\n"
+             "            vec4 v = tile[ig][uint(clamp(int(ty+ky),ylo,yhi))][uint(clamp(int(tx+kx),xl,xh))];\n"
+             "            { NGU_LOAD_PAIR(u_idx+0u, u0, wa0, wb0); NGU_MAC(hsum,v.x,wa0); NGU_MAC(hsum,v.y,wb0); }\n"
+             "            { NGU_LOAD_PAIR(u_idx+1u, u1, wa1, wb1); NGU_MAC(hsum,v.z,wa1); NGU_MAC(hsum,v.w,wb1); }\n"
+             "            u_idx += 2u;\n        }\n    }\n";
+        if (!aa) {
+            s += "    barrier();\n    if (tid < 252u) {\n"
+                 "        float ca=uintBitsToFloat(0x3f5f3333u),cb=uintBitsToFloat(0x3e766666u),cc=uintBitsToFloat(0xbdaccccdu),cd=uintBitsToFloat(0xbce66666u);\n"
+                 "        uint r=tid/14u, lx=tid-r*14u;\n"
+                 "        float s0=src_t[r+2u][lx+2u],s1=src_t[r+2u][lx+3u],s2=src_t[r+2u][lx+4u],s3=src_t[r+2u][lx+5u],s4=src_t[r+2u][lx+6u];\n"
+                 "        tile[0][r][lx].x=(((cd*s0)+(cb*s1))+(ca*s2))+(cc*s3);\n"
+                 "        tile[0][r][lx].y=(((cc*s1)+(ca*s2))+(cb*s3))+(cd*s4);\n"
+                 "    }\n    barrier();\n";
+        }
+        s += "    if (tx>=14u||ty>=14u) return;\n    uint x=uint(bx)+tx,y=uint(by)+ty;\n    if (x>=pc.width||y>=pc.height) return;\n    uint ox=x*2u,oy=y*2u;\n";
+        if (aa) {
+            s += "    NGU_RAW u00=src_t[ty+4u][tx+4u]; float s00=NGU_FROM_RAW(u00),s10=NGU_FROM_RAW(src_t[ty+4u][tx+5u]),s01=NGU_FROM_RAW(src_t[ty+5u][tx+4u]),s11=NGU_FROM_RAW(src_t[ty+5u][tx+5u]);\n"
+                 "    precise float p10=(s00+s10)*0.5+hsum.y, p01=(s00+s01)*0.5+hsum.x, p11=(((s00+s10)+s01)+s11)*0.25+hsum.z;\n"
+                 "    d[(oy+0u)*pc.dst_s+ox+0u]=u00; d[(oy+0u)*pc.dst_s+ox+1u]=NGU_TO_RAW(p10); d[(oy+1u)*pc.dst_s+ox+0u]=NGU_TO_RAW(p01); d[(oy+1u)*pc.dst_s+ox+1u]=NGU_TO_RAW(p11);\n";
+        } else {
+            s += "    float ca=uintBitsToFloat(0x3f5f3333u),cb=uintBitsToFloat(0x3e766666u),cc=uintBitsToFloat(0xbdaccccdu),cd=uintBitsToFloat(0xbce66666u);\n"
+                 "    float r0a=tile[0][ty+0u][tx].x,r1a=tile[0][ty+1u][tx].x,r2a=tile[0][ty+2u][tx].x,r3a=tile[0][ty+3u][tx].x,r4a=tile[0][ty+4u][tx].x;\n"
+                 "    float r0b=tile[0][ty+0u][tx].y,r1b=tile[0][ty+1u][tx].y,r2b=tile[0][ty+2u][tx].y,r3b=tile[0][ty+3u][tx].y,r4b=tile[0][ty+4u][tx].y;\n"
+                 "    precise float p00=((((cd*r0a)+(cb*r1a))+(ca*r2a))+(cc*r3a))+hsum.x;\n"
+                 "    precise float p10=((((cd*r0b)+(cb*r1b))+(ca*r2b))+(cc*r3b))+hsum.y;\n"
+                 "    precise float p01=((((cc*r1a)+(ca*r2a))+(cb*r3a))+(cd*r4a))+hsum.z;\n"
+                 "    precise float p11=((((cc*r1b)+(ca*r2b))+(cb*r3b))+(cd*r4b))+hsum.w;\n"
+                 "    d[(oy+0u)*pc.dst_s+ox+0u]=p00; d[(oy+0u)*pc.dst_s+ox+1u]=p10; d[(oy+1u)*pc.dst_s+ox+0u]=p01; d[(oy+1u)*pc.dst_s+ox+1u]=p11;\n";
+        }
+        s += "}\n";
+        return s;
+    }
 };
 
 enum class Topology { Fallback, Low, Medium, High, VeryHigh };
@@ -1031,37 +1781,31 @@ Topology classify_topology(const Model &model, VkPhysicalDeviceLimits limits, bo
     if (b.size() == 3 && is_conv3(b[0], 1, 8) && is_conv3(b[1], 8, 8) && is_conv3(b[2], 8, 8) &&
         h.input_channels() == 8) {
         topo = Topology::Low;
-        min_smem = 16752;
-        max_ubo = 385 * 16;
+        min_smem = half ? 20880 : 14736;
+        max_ubo = half ? 3104 : 6208;
     } else if (b.size() == 5 && is_conv3(b[0], 1, 12) && is_conv3(b[1], 12, 8) &&
                is_conv3(b[2], 8, 8) && is_conv3(b[3], 8, 8) && is_conv3(b[4], 8, 8) &&
                h.input_channels() == 8) {
         topo = Topology::Medium;
-        min_smem = 25152;
-        max_ubo = 292 * 16;
+        min_smem = half ? 21504 : 29184;
+        max_ubo = half ? 2368 : 4736;
     } else if (b.size() == 6 && is_conv3(b[0], 1, 12) && is_conv3(b[1], 12, 12) &&
                is_conv3(b[2], 12, 12) && is_conv3(b[3], 12, 12) && is_conv3(b[4], 12, 12) &&
                is_conv3(b[5], 12, 12) && h.input_channels() == 12) {
         topo = Topology::High;
-        min_smem = 25152;
-        max_ubo = 436 * 16;
+        min_smem = half ? 26624 : 29696;
+        max_ubo = half ? 5312 : 10624;
     } else if (b.size() == 8 && is_conv3(b[0], 1, 16) && is_conv3(b[1], 16, 16) &&
                is_conv3(b[2], 16, 16) && is_conv3(b[3], 16, 16) && is_conv3(b[4], 16, 16) &&
                is_conv3(b[5], 16, 16) && is_conv3(b[6], 16, 16) && is_conv3(b[7], 16, 16) &&
                h.input_channels() == 16) {
         topo = Topology::VeryHigh;
-        min_smem = 32768;
-        max_ubo = 620 * 16;
+        min_smem = half ? 28288 : 30720;
+        max_ubo = half ? 9600 : 9920;
     }
     if (topo == Topology::Fallback)
         return Topology::Fallback;
-    if (half) {
-        min_smem /= 2;
-        if (topo == Topology::High)
-            min_smem = 17024; // C=12 32x12 tail: features + baseline X + original plane
-    }
-    const auto parameter_limit = limits.maxUniformBufferRange;
-    if (limits.maxComputeSharedMemorySize < min_smem || parameter_limit < max_ubo ||
+    if (limits.maxComputeSharedMemorySize < min_smem || limits.maxUniformBufferRange < max_ubo ||
         limits.maxComputeWorkGroupInvocations < 256 || limits.maxComputeWorkGroupSize[0] < 32 ||
         limits.maxComputeWorkGroupSize[1] < 16)
         return Topology::Fallback;
@@ -1079,6 +1823,7 @@ struct Vulkan::Impl {
     VkPhysicalDeviceLimits limits{};
     VSGPUExecPool *pool = nullptr;
     VkDescriptorSetLayout descriptors = VK_NULL_HANDLE;
+    VkDescriptorUpdateTemplate descriptor_template = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     std::vector<VkPipeline> owned_pipelines;
     Buffer parameters{nullptr, BufferDeleter{nullptr}};
@@ -1088,45 +1833,31 @@ struct Vulkan::Impl {
     bool half_compute = false;
     VSVideoFormat format{};
 
-    // Fast path state
     bool fast_path = false;
     std::vector<FastPass> fast_passes;
     std::array<VkDescriptorBufferInfo, 2> fast_slices{};
     VkDeviceSize workspace_size = 0;
 
-    struct WorkspaceSlot {
-        Buffer buf{nullptr, BufferDeleter{nullptr}};
-        VSVulkanBufferInfo info{};
-        std::uint64_t signaled = 0;
-        bool busy = false;
-    };
-    struct WaitNode {
-        std::condition_variable cv;
-        WorkspaceSlot *slot = nullptr;
-        WaitNode *next = nullptr;
-    };
-    static constexpr std::size_t kWorkspaceSlots = 2;
-    mutable std::mutex ws_mutex;
-    mutable WaitNode *ws_wait_head = nullptr;
-    mutable WaitNode *ws_wait_tail = nullptr;
-    mutable std::vector<WorkspaceSlot> ws_slots;
+    mutable std::once_flag ws_once;
+    mutable Buffer ws_buf{nullptr, BufferDeleter{nullptr}};
+    mutable VSVulkanBufferInfo ws_info{};
 
-    // Fallback state
     VkPipeline fallback_pipeline = VK_NULL_HANDLE;
     std::vector<LayerInfo> layers;
-    std::array<VkDescriptorBufferInfo, 5> fallback_slices{}; // ping, pong, head, baseline X/Y
+    std::array<VkDescriptorBufferInfo, 5> fallback_slices{};
 
     ~Impl() {
-        // Drain all in-flight GPU submissions before destroying workspace buffers, pipelines, or pools.
         if (gpu && pool) {
             gpu->freeGPUExecPool(pool);
             pool = nullptr;
         }
-        ws_slots.clear();
+        ws_buf.reset();
         if (vk && handles.device != VK_NULL_HANDLE) {
             for (VkPipeline p : owned_pipelines)
                 if (p != VK_NULL_HANDLE)
                     vk->vkDestroyPipeline(handles.device, p, nullptr);
+            if (descriptor_template != VK_NULL_HANDLE)
+                vk->vkDestroyDescriptorUpdateTemplate(handles.device, descriptor_template, nullptr);
             if (layout != VK_NULL_HANDLE)
                 vk->vkDestroyPipelineLayout(handles.device, layout, nullptr);
             if (descriptors != VK_NULL_HANDLE)
@@ -1180,8 +1911,6 @@ struct Vulkan::Impl {
         try {
             require_spirv_precision({code, code_size / sizeof(*code)}, half_compute ? 16 : 32);
 #ifdef NGU_DUMP_SHADERS
-            // Developer audit only, compiled out of the timed/default build.
-            // Capture actual compiler output, including scalar fallback modules.
             if (const char *directory = std::getenv("NGU_SHADER_DUMP_DIR")) {
                 std::filesystem::create_directories(directory);
                 std::uint64_t hash = 14695981039346656037ull;
@@ -1264,6 +1993,24 @@ struct Vulkan::Impl {
         pl.pushConstantRangeCount = 1;
         pl.pPushConstantRanges = &push_range;
         vk_check(vk->vkCreatePipelineLayout(handles.device, &pl, nullptr, &layout), "pipeline layout");
+
+        const std::array<VkDescriptorUpdateTemplateEntry, 4> entries{{
+            {0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 0 * sizeof(VkDescriptorBufferInfo), sizeof(VkDescriptorBufferInfo)},
+            {1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 * sizeof(VkDescriptorBufferInfo), sizeof(VkDescriptorBufferInfo)},
+            {2, 0, 1, param_type,                        2 * sizeof(VkDescriptorBufferInfo), sizeof(VkDescriptorBufferInfo)},
+            {3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * sizeof(VkDescriptorBufferInfo), sizeof(VkDescriptorBufferInfo)},
+        }};
+        VkDescriptorUpdateTemplateCreateInfo ti{};
+        ti.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO;
+        ti.descriptorUpdateEntryCount = static_cast<std::uint32_t>(entries.size());
+        ti.pDescriptorUpdateEntries = entries.data();
+        ti.templateType = VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_PUSH_DESCRIPTORS;
+        ti.descriptorSetLayout = descriptors;
+        ti.pipelineBindPoint = VK_PIPELINE_BIND_POINT_COMPUTE;
+        ti.pipelineLayout = layout;
+        ti.set = 0;
+        vk_check(vk->vkCreateDescriptorUpdateTemplate(handles.device, &ti, nullptr, &descriptor_template),
+                 "descriptor update template");
     }
 
     void init_fast(const Model &model, Topology topo) {
@@ -1273,150 +2020,242 @@ struct Vulkan::Impl {
 
         std::vector<float> ubo_data;
         const VkDeviceSize ubo_align = std::max<VkDeviceSize>(16, limits.minUniformBufferOffsetAlignment);
-        const auto append_ubo_block = [&](const std::vector<float> &block, VkDeviceSize &out_off,
-                                          VkDeviceSize &out_size) {
-            const VkDeviceSize element_bytes = 4;
-            const VkDeviceSize cur_bytes = static_cast<VkDeviceSize>(ubo_data.size()) * element_bytes;
-            out_off = align_up(cur_bytes, ubo_align);
-            if (out_off > cur_bytes)
-                ubo_data.resize(static_cast<std::size_t>(out_off / element_bytes), 0.0f);
-            out_size = static_cast<VkDeviceSize>(block.size()) * element_bytes;
-            if (out_size > limits.maxUniformBufferRange)
+        const VkDeviceSize elem_bytes = half_compute ? 2 : 4;
+
+        const auto append_ubo = [&](std::vector<float> &blk, VkDeviceSize &off, VkDeviceSize &sz) {
+            align_uvec4_floats(blk);
+            const VkDeviceSize cur_bytes = static_cast<VkDeviceSize>(ubo_data.size()) * elem_bytes;
+            off = align_up(cur_bytes, ubo_align);
+            if (off > cur_bytes)
+                ubo_data.resize(static_cast<std::size_t>(off / elem_bytes), 0.0f);
+            sz = static_cast<VkDeviceSize>(blk.size()) * elem_bytes;
+            if (sz > limits.maxUniformBufferRange)
                 throw std::runtime_error("fused parameters exceed Vulkan buffer range");
-            ubo_data.insert(ubo_data.end(), block.begin(), block.end());
+            ubo_data.insert(ubo_data.end(), blk.begin(), blk.end());
+            return static_cast<std::uint32_t>(blk.size() / 8);
         };
-        const auto append_head = [&](std::vector<float> &dst) {
-            if (aa) {
-                append_floats(dst, pack_aa_head_3x3(model.head));
-                append_floats(dst, pack_bias(model.head));
-            } else {
-                append_floats(dst, pack_k4_head_3x3(model.head));
-                const float bh = model.head.bias_at(0);
-                dst.insert(dst.end(), 4, bh);
-            }
+
+        const auto make_body = [&](std::vector<float> &blk, std::size_t idx, bool col_order) -> StageDesc {
+            const Layer &l = model.body[idx];
+            const auto w_off = (l.input_channels() == 1)
+                ? pack_1toC_aligned(blk, l)
+                : pack_nc4_ordered(blk, l, col_order);
+            const auto b_off = pack_bias_aligned(blk, l);
+            return StageDesc{l.input_channels(), l.output_channels(), col_order, false, w_off, b_off};
+        };
+        const auto make_head = [&](std::vector<float> &blk, bool col_order) -> StageDesc {
+            const Layer &h = model.head;
+            const auto w_off = aa ? pack_aa_head_ordered(blk, h, col_order)
+                                  : pack_k4_head_ordered(blk, h, col_order);
+            const auto b_off = aa ? pack_bias_aligned(blk, h) : pack_k4_bias_aligned(blk, h);
+            return StageDesc{h.input_channels(), 4, col_order, true, w_off, b_off};
         };
 
         int slice_channels = 0;
         if (topo == Topology::Low) {
             std::vector<float> blk;
-            append_floats(blk, pack_1toC(model.body[0]));
-            append_floats(blk, pack_bias(model.body[0]));
-            append_floats(blk, pack_nc4(model.body[1]));
-            append_floats(blk, pack_bias(model.body[1]));
-            append_floats(blk, pack_nc4(model.body[2]));
-            append_floats(blk, pack_bias(model.body[2]));
-            append_head(blk);
+            std::array<StageDesc, 4> st{{
+                make_body(blk, 0, false),
+                make_body(blk, 1, false),
+                make_body(blk, 2, false),
+                make_head(blk, false),
+            }};
             VkDeviceSize off = 0, sz = 0;
-            append_ubo_block(blk, off, sz);
-            VkPipeline pipe = compile_pipeline(shader.gen_low_fused(aa).c_str());
-            fast_passes.push_back(FastPass{pipe, off, sz, 14, 14, -1, -2});
+            const auto total_uvec4 = append_ubo(blk, off, sz);
+            if (half_compute || limits.maxComputeSharedMemorySize >= 41760) {
+                VkPipeline pipe = compile_pipeline(shader.gen_low_26x26(st, total_uvec4, aa).c_str());
+                fast_passes.push_back(FastPass{pipe, off, sz, 26, 26, -1, -2});
+            } else {
+                VkPipeline pipe = compile_pipeline(shader.gen_low_32kb(st, total_uvec4, aa).c_str());
+                fast_passes.push_back(FastPass{pipe, off, sz, 14, 14, -1, -2});
+            }
         } else if (topo == Topology::Medium) {
+            // 3-Pass Pure Warp-Stripe (2 + 2 + 2): Spatial(0)->Col(1), Spatial(2)->Col(3), Spatial(4)->Col(head).
             slice_channels = 8;
-            // Pass 1: 1->12->8 (32x12)
             {
                 std::vector<float> blk;
-                append_floats(blk, pack_1toC(model.body[0]));
-                append_floats(blk, pack_bias(model.body[0]));
-                append_floats(blk, pack_nc4(model.body[1]));
-                append_floats(blk, pack_bias(model.body[1]));
+                std::array<StageDesc, 2> st{{make_body(blk, 0, false), make_body(blk, 1, true)}};
                 VkDeviceSize off = 0, sz = 0;
-                append_ubo_block(blk, off, sz);
-                VkPipeline pipe = compile_pipeline(shader.gen_in_fused2_3py(12, 8, false).c_str());
-                fast_passes.push_back(FastPass{pipe, off, sz, 32, 12, -1, 0});
+                const auto nu = append_ubo(blk, off, sz);
+                const bool use_3py = half_compute || (limits.maxComputeSharedMemorySize >= 42912);
+                const int py = use_3py ? 3 : 2;
+                const auto th = static_cast<std::uint32_t>(8 * py - 2);
+                VkPipeline pipe = compile_pipeline(shader.gen_2L_spa_col_stripe(st, nu, aa, 8, py, true).c_str());
+                fast_passes.push_back(FastPass{pipe, off, sz, 30, th, -1, 0});
             }
-            // Pass 2: 8->8->8 (FP16 32x12 / FP32 16x16)
             {
                 std::vector<float> blk;
-                append_floats(blk, pack_nc4(model.body[2]));
-                append_floats(blk, pack_bias(model.body[2]));
-                append_floats(blk, pack_nc4(model.body[3]));
-                append_floats(blk, pack_bias(model.body[3]));
+                std::array<StageDesc, 2> st{{make_body(blk, 2, false), make_body(blk, 3, true)}};
                 VkDeviceSize off = 0, sz = 0;
-                append_ubo_block(blk, off, sz);
-                VkPipeline pipe = compile_pipeline((half_compute ? shader.gen_tail_32x12(8, true, true) :
-                    shader.gen_fused2_16x16(8)).c_str());
-                fast_passes.push_back(FastPass{pipe, off, sz, half_compute ? 32u : 16u,
-                    half_compute ? 12u : 16u, 0, 1});
+                const auto nu = append_ubo(blk, off, sz);
+                const int py = half_compute ? 4 : 3;
+                const auto th = static_cast<std::uint32_t>(8 * py - 2);
+                VkPipeline pipe = compile_pipeline(shader.gen_2L_spa_col_stripe(st, nu, aa, 8, py, true).c_str());
+                fast_passes.push_back(FastPass{pipe, off, sz, 30, th, 0, 1});
             }
-            // Pass 3: 8->8 + head (32x12)
             {
                 std::vector<float> blk;
-                append_floats(blk, pack_nc4(model.body[4]));
-                append_floats(blk, pack_bias(model.body[4]));
-                append_head(blk);
+                std::array<StageDesc, 2> st{{make_body(blk, 4, false), make_head(blk, true)}};
                 VkDeviceSize off = 0, sz = 0;
-                append_ubo_block(blk, off, sz);
-                const std::string tail = shader.gen_tail_32x12(8, aa);
-                VkPipeline pipe = compile_pipeline(tail.c_str());
-                fast_passes.push_back(FastPass{pipe, off, sz,
-                    32, 12, 1, -2});
+                const auto nu = append_ubo(blk, off, sz);
+                const bool use_3py = half_compute || (limits.maxComputeSharedMemorySize >= 32032);
+                const int py = use_3py ? 3 : 2;
+                const auto th = static_cast<std::uint32_t>(8 * py - 2);
+                VkPipeline pipe = compile_pipeline(shader.gen_2L_spa_col_stripe(st, nu, aa, 8, py, true).c_str());
+                fast_passes.push_back(FastPass{pipe, off, sz, 30, th, 1, -2});
+            }
+        } else if (topo == Topology::High) {
+            // Schedule: Spatial(0), Col(1..4), Spatial(5), Col(head).
+            slice_channels = 12;
+            // Pass 1: b0 (1->12 Spatial) + b1 (12->12 Col) Pure Warp-Stripe
+            {
+                std::vector<float> blk;
+                std::array<StageDesc, 2> st{{make_body(blk, 0, false), make_body(blk, 1, true)}};
+                VkDeviceSize off = 0, sz = 0;
+                const auto nu = append_ubo(blk, off, sz);
+                const int py = half_compute ? 3 : 2;
+                const auto th = static_cast<std::uint32_t>(8 * py - 2);
+                VkPipeline pipe = compile_pipeline(shader.gen_2L_spa_col_stripe(st, nu, aa, 8, py, true).c_str());
+                fast_passes.push_back(FastPass{pipe, off, sz, 30, th, -1, 0});
+            }
+            int cur_slice = 0;
+            // Middle layers b2, b3, b4:
+            // - FP16: fuse b2+b3 via 30x30 (8w,4py) FULL (cuts 100 MB DRAM!) + b4 via 1L 32x12 (4w,3py) FULL
+            // - FP32: 3 x 1L 32x12 (6w,2py) FULL (272 us/layer, 24 warps/SM, smem=22.8 KB)
+            if (half_compute && limits.maxComputeSharedMemorySize >= 27744) {
+                {
+                    std::vector<float> blk;
+                    std::array<StageDesc, 2> st{{make_body(blk, 2, true), make_body(blk, 3, true)}};
+                    VkDeviceSize off = 0, sz = 0;
+                    const auto nu = append_ubo(blk, off, sz);
+                    VkPipeline pipe = compile_pipeline(shader.gen_2L_col_stripe(st, nu, 8, 4, true).c_str());
+                    fast_passes.push_back(FastPass{pipe, off, sz, 30, 30, 0, 1});
+                }
+                {
+                    std::vector<float> blk;
+                    StageDesc st = make_body(blk, 4, true);
+                    VkDeviceSize off = 0, sz = 0;
+                    const auto nu = append_ubo(blk, off, sz);
+                    VkPipeline pipe = compile_pipeline(shader.gen_1L_stripe(st, nu, 4, 3).c_str());
+                    fast_passes.push_back(FastPass{pipe, off, sz, 32, 12, 1, 0});
+                }
+                cur_slice = 0;
+            } else {
+                const int wg_y = half_compute ? 4 : 6;
+                const int py = half_compute ? 3 : 2;
+                VkPipeline p_1l = VK_NULL_HANDLE;
+                for (std::size_t i = 2; i <= 4; ++i) {
+                    std::vector<float> blk;
+                    StageDesc st = make_body(blk, i, true);
+                    VkDeviceSize off = 0, sz = 0;
+                    const auto nu = append_ubo(blk, off, sz);
+                    if (p_1l == VK_NULL_HANDLE)
+                        p_1l = compile_pipeline(shader.gen_1L_stripe(st, nu, wg_y, py).c_str());
+                    const int next_slice = cur_slice ^ 1;
+                    fast_passes.push_back(FastPass{p_1l, off, sz, 32, 12, cur_slice, next_slice});
+                    cur_slice = next_slice;
+                }
+            }
+            // Final:
+            // - FP16: Fused Tail b5 (Spatial) + Head (Col) + Combine on 30x22 (330 us, 23.1 KB smem, zero intermediate DRAM!)
+            // - FP32: Split b5 (1L 6w,2py Spatial FULL: 382 us) + Head (32x12 4w,3py: 199 us, 29.5 KB smem < 32 KB)
+            if (half_compute) {
+                std::vector<float> blk;
+                std::array<StageDesc, 2> st{{make_body(blk, 5, false), make_head(blk, true)}};
+                VkDeviceSize off = 0, sz = 0;
+                const auto nu = append_ubo(blk, off, sz);
+                VkPipeline pipe = compile_pipeline(shader.gen_2L_spa_col_stripe(st, nu, aa, 8, 3, true).c_str());
+                fast_passes.push_back(FastPass{pipe, off, sz, 30, 22, cur_slice, -2});
+            } else {
+                const int next_slice = cur_slice ^ 1;
+                {
+                    std::vector<float> blk;
+                    StageDesc st = make_body(blk, 5, false);
+                    VkDeviceSize off = 0, sz = 0;
+                    const auto nu = append_ubo(blk, off, sz);
+                    VkPipeline pipe = compile_pipeline(shader.gen_1L_stripe(st, nu, 6, 2, true).c_str());
+                    fast_passes.push_back(FastPass{pipe, off, sz, 32, 12, cur_slice, next_slice});
+                }
+                {
+                    std::vector<float> blk;
+                    StageDesc st = make_head(blk, true);
+                    VkDeviceSize off = 0, sz = 0;
+                    const auto nu = append_ubo(blk, off, sz);
+                    VkPipeline pipe = compile_pipeline(shader.gen_head_32x12(st, nu, aa, false).c_str());
+                    fast_passes.push_back(FastPass{pipe, off, sz, 32, 12, next_slice, -2});
+                }
             }
         } else {
-            const bool is_high = (topo == Topology::High);
-            const int C = is_high ? 12 : 16;
-            const std::uint32_t mid_tw = 32;
-            const std::uint32_t mid_th = 12;
-            slice_channels = C;
-            // Pass 1: 1->C->C fused (32x12)
+            // VeryHigh (C=16): Spatial(0), Col(1..7), head(Col if aa else Spatial).
+            slice_channels = 16;
+            // Pass 1: b0 (1->16 Spatial) + b1 (16->16 Col) Pure Warp-Stripe
             {
                 std::vector<float> blk;
-                append_floats(blk, pack_1toC(model.body[0]));
-                append_floats(blk, pack_bias(model.body[0]));
-                append_floats(blk, pack_nc4(model.body[1]));
-                append_floats(blk, pack_bias(model.body[1]));
+                std::array<StageDesc, 2> st{{make_body(blk, 0, false), make_body(blk, 1, true)}};
                 VkDeviceSize off = 0, sz = 0;
-                append_ubo_block(blk, off, sz);
-                const std::string src_in = shader.gen_in_fused2_3py(C, C, true);
-                VkPipeline p_in = compile_pipeline(src_in.c_str());
-                fast_passes.push_back(FastPass{p_in, off, sz, 32, 12, -1, 0});
-            }
-            // High: FP16 32x12 / FP32 14x14 tail. VeryHigh: 3py body + head.
-            const std::size_t tail_fused = is_high ? 1 : 0;
-            const std::size_t mid_end = model.body.size() - tail_fused;
-            const VkPipeline p_1l = compile_pipeline(shader.gen_1L_3py(C).c_str());
-            int cur_slice = 0;
-            for (std::size_t i = 2; i < mid_end; ++i) {
-                std::vector<float> blk;
-                append_floats(blk, pack_nc4(model.body[i]));
-                append_floats(blk, pack_bias(model.body[i]));
-                VkDeviceSize off = 0, sz = 0;
-                append_ubo_block(blk, off, sz);
-                const int next_slice = cur_slice ^ 1;
-                fast_passes.push_back(FastPass{p_1l, off, sz, mid_tw, mid_th, cur_slice, next_slice});
-                cur_slice = next_slice;
-            }
-            // Final pass: High fused tail, or VeryHigh standalone head.
-            {
-                std::vector<float> blk;
-                if (tail_fused) {
-                    append_floats(blk, pack_nc4(model.body.back()));
-                    append_floats(blk, pack_bias(model.body.back()));
+                const auto nu = append_ubo(blk, off, sz);
+                if (half_compute || limits.maxComputeSharedMemorySize >= 37408) {
+                    const int py = half_compute ? 3 : 2;
+                    const auto th = static_cast<std::uint32_t>(8 * py - 2);
+                    VkPipeline pipe = compile_pipeline(shader.gen_2L_spa_col_stripe(st, nu, aa, 8, py, true).c_str());
+                    fast_passes.push_back(FastPass{pipe, off, sz, 30, th, -1, 0});
+                } else {
+                    VkPipeline pipe = compile_pipeline(shader.gen_2L_32x12(st, nu, aa, false).c_str());
+                    fast_passes.push_back(FastPass{pipe, off, sz, 32, 12, -1, 0});
                 }
-                append_head(blk);
+            }
+            int cur_slice = 0;
+            // Body b2..b7 (6 layers):
+            // - FP16: 1L 32x16 (8w, 2py FULL: regs=36, smem=19.6 KB -> 40 warps/SM, 354 us/layer, -0.35 ms & same W!)
+            // - FP32: 1L 32x12 (6w, 2py FULL: regs=81, smem=30.5 KB -> 18 warps/SM, 544 us/layer)
+            {
+                const int wg_y = half_compute ? 8 : 6;
+                const int py = 2;
+                const auto th = static_cast<std::uint32_t>(wg_y * py);
+                VkPipeline p_1l = VK_NULL_HANDLE;
+                for (std::size_t i = 2; i < model.body.size(); ++i) {
+                    std::vector<float> blk;
+                    StageDesc st = make_body(blk, i, true);
+                    VkDeviceSize off = 0, sz = 0;
+                    const auto nu = append_ubo(blk, off, sz);
+                    if (p_1l == VK_NULL_HANDLE)
+                        p_1l = compile_pipeline(shader.gen_1L_stripe(st, nu, wg_y, py).c_str());
+                    const int next_slice = cur_slice ^ 1;
+                    fast_passes.push_back(FastPass{p_1l, off, sz, 32, th, cur_slice, next_slice});
+                    cur_slice = next_slice;
+                }
+            }
+            // Final Head + Combine: unified 32x12 3py immediate-constant kernel
+            {
+                std::vector<float> blk;
+                StageDesc st = make_head(blk, aa);
                 VkDeviceSize off = 0, sz = 0;
-                append_ubo_block(blk, off, sz);
-                const bool head_3py = !tail_fused && aa;
-                const std::string src_end = tail_fused
-                    ? (half_compute ? shader.gen_tail_32x12(12, aa) : shader.gen_tail_14x14(12, aa))
-                    : (head_3py ? shader.gen_head_end_3py(C) : shader.gen_head_end(C, false));
-                const std::uint32_t end_tw = tail_fused ? (half_compute ? 32 : 14) : (head_3py ? 32 : 16);
-                const std::uint32_t end_th = tail_fused ? (half_compute ? 12 : 14) : (head_3py ? 12 : 16);
-                VkPipeline p_end = compile_pipeline(src_end.c_str());
-                fast_passes.push_back(FastPass{p_end, off, sz, end_tw, end_th, cur_slice, -2});
+                const auto nu = append_ubo(blk, off, sz);
+                const bool alias_bx = !half_compute && (limits.maxComputeSharedMemorySize < 37120);
+                VkPipeline pipe = compile_pipeline(shader.gen_head_32x12(st, nu, aa, alias_bx).c_str());
+                fast_passes.push_back(FastPass{pipe, off, sz, 32, 12, cur_slice, -2});
             }
         }
 
         if (slice_channels > 0) {
-            const std::uint32_t g_count = static_cast<std::uint32_t>(slice_channels / 4);
+            const auto g_count = static_cast<std::uint32_t>(slice_channels / 4);
             if (static_cast<std::uint64_t>(width) * height >
                 std::numeric_limits<std::uint32_t>::max() / g_count)
                 throw std::invalid_argument("Vulkan feature plane stride overflow");
+            int max_slice_idx = -1;
+            for (const auto &p : fast_passes)
+                max_slice_idx = std::max(max_slice_idx, std::max(p.src_slice, p.dst_slice));
             VkDeviceSize cursor = 0;
-            const VkDeviceSize s0 = add_slice(width, height, slice_channels, cursor);
-            const VkDeviceSize s1 = add_slice(width, height, slice_channels, cursor);
-            const VkDeviceSize slice_bytes = static_cast<VkDeviceSize>(width) * height * slice_channels * (half_compute ? 2 : 4);
-            fast_slices[0] = {VK_NULL_HANDLE, s0, slice_bytes};
-            fast_slices[1] = {VK_NULL_HANDLE, s1, slice_bytes};
+            const VkDeviceSize slice_bytes =
+                static_cast<VkDeviceSize>(width) * height * slice_channels * (half_compute ? 2 : 4);
+            if (max_slice_idx >= 0) {
+                const VkDeviceSize s0 = add_slice(width, height, slice_channels, cursor);
+                fast_slices[0] = {VK_NULL_HANDLE, s0, slice_bytes};
+            }
+            if (max_slice_idx >= 1) {
+                const VkDeviceSize s1 = add_slice(width, height, slice_channels, cursor);
+                fast_slices[1] = {VK_NULL_HANDLE, s1, slice_bytes};
+            }
             workspace_size = cursor;
         }
 
@@ -1424,20 +2263,18 @@ struct Vulkan::Impl {
     }
 
     void upload_parameters(const std::vector<float> &values, VkBufferUsageFlags usage) {
-        const bool half_uniform = half_compute && (usage & VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
         const VkDeviceSize bytes = align_up(
-            static_cast<VkDeviceSize>(values.size()) * (half_compute && !half_uniform ? 2 : 4), 4);
+            static_cast<VkDeviceSize>(values.size()) * (half_compute ? 2 : 4), 4);
         const auto max_range = (usage & VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) ?
             limits.maxUniformBufferRange : limits.maxStorageBufferRange;
         if (!fast_path && bytes > max_range)
             throw std::runtime_error("parameters exceed Vulkan buffer range");
         parameters = buffer(bytes, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, parameter_info);
-        if (half_uniform) {
-            std::vector<std::uint32_t> packed(values.size(), 0);
+        if (half_compute && (usage & VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) {
+            std::vector<std::uint32_t> packed(static_cast<std::size_t>(bytes / 4), 0);
             for (std::size_t i = 0; i < values.size(); ++i)
-                packed[(i / 4) * 4 + (i % 4) / 2] |=
-                    std::uint32_t(float_to_half(values[i])) << ((i % 2) * 16);
+                packed[i >> 1] |= std::uint32_t(float_to_half(values[i])) << ((i & 1) * 16);
             upload_device_buffer(packed, parameter_info.buffer);
         } else if (half_compute) {
             std::vector<std::uint16_t> halves(static_cast<std::size_t>(bytes / 2), 0);
@@ -1534,7 +2371,6 @@ struct Vulkan::Impl {
             VkPhysicalDeviceFeatures2 features{};
             features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
             features.pNext = &f11;
-            // R82 enables reported shaderFloat16, and requires storageBuffer16BitAccess.
             vk->vkGetPhysicalDeviceFeatures2(handles.physicalDevice, &features);
             require_half_capabilities({f12.shaderFloat16 != 0, f11.storageBuffer16BitAccess != 0,
                 floats.shaderSignedZeroInfNanPreserveFloat16 != 0,
@@ -1561,16 +2397,14 @@ struct Vulkan::Impl {
         if (topo != Topology::Fallback)
             init_fast(model, topo);
         else
-            init_fallback(model); // Same precision as the fused path, never a promotion.
-        if (workspace_size > 0)
-            ws_slots.resize(kWorkspaceSlots);
+            init_fallback(model);
     }
 
-    void barrier(VkCommandBuffer cmd) const {
+    void barrier(VkCommandBuffer cmd, VkAccessFlags2 src_access = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT) const {
         VkMemoryBarrier2 memory{};
         memory.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
         memory.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        memory.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        memory.srcAccessMask = src_access;
         memory.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
         memory.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
         VkDependencyInfo info{};
@@ -1601,26 +2435,13 @@ struct Vulkan::Impl {
 
     void push_bindings(VkCommandBuffer cmd, const VkDescriptorBufferInfo &src,
                        const VkDescriptorBufferInfo &dst, const VkDescriptorBufferInfo &params,
-                       VkDescriptorType param_type, const VkDescriptorBufferInfo &aux) const {
+                       const VkDescriptorBufferInfo &aux) const {
         const std::array<VkDescriptorBufferInfo, 4> buffers{src, dst, params, aux};
-        std::array<VkWriteDescriptorSet, 4> writes{};
-        for (std::uint32_t i = 0; i < writes.size(); ++i) {
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstBinding = i;
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = (i == 2) ? param_type : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pBufferInfo = &buffers[i];
-        }
-        vk->vkCmdPushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0,
-                                   static_cast<std::uint32_t>(writes.size()), writes.data());
+        vk->vkCmdPushDescriptorSetWithTemplate(cmd, descriptor_template, layout, 0, buffers.data());
     }
 
     template <typename PushT>
-    void dispatch_kernel(VkCommandBuffer cmd, const PushT &push, const VkDescriptorBufferInfo &src,
-                         const VkDescriptorBufferInfo &dst, const VkDescriptorBufferInfo &params,
-                         VkDescriptorType param_type, const VkDescriptorBufferInfo &aux,
-                         std::uint32_t gx, std::uint32_t gy, std::uint32_t gz, bool need_barrier) const {
-        push_bindings(cmd, src, dst, params, param_type, aux);
+    void push_constants(VkCommandBuffer cmd, const PushT &push) const {
         VkPushConstantsInfo constants{};
         constants.sType = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO;
         constants.layout = layout;
@@ -1628,98 +2449,23 @@ struct Vulkan::Impl {
         constants.size = sizeof(push);
         constants.pValues = &push;
         vk->vkCmdPushConstants2(cmd, &constants);
-        vk->vkCmdDispatch(cmd, gx, gy, gz);
-        if (need_barrier)
-            barrier(cmd);
     }
 
-    struct SlotLease {
-        const Impl &impl;
-        WorkspaceSlot *slot = nullptr;
-
-        explicit SlotLease(const Impl &i) : impl(i) {}
-        SlotLease(const SlotLease &) = delete;
-        SlotLease &operator=(const SlotLease &) = delete;
-
-        void handoff_locked() {
-            if (impl.ws_wait_head) {
-                WaitNode *next = impl.ws_wait_head;
-                impl.ws_wait_head = next->next;
-                if (!impl.ws_wait_head)
-                    impl.ws_wait_tail = nullptr;
-                next->next = nullptr;
-                next->slot = slot;
-                slot = nullptr;
-                next->cv.notify_one();
-                return;
-            }
-            slot->busy = false;
-            slot = nullptr;
-        }
-
-        ~SlotLease() {
-            if (slot) {
-                std::lock_guard lock(impl.ws_mutex);
-                handoff_locked();
-            }
-        }
-
-        VSVulkanBufferInfo acquire() {
-            if (impl.workspace_size == 0)
-                return {};
-            std::uint64_t wait_val = 0;
-            {
-                std::unique_lock lock(impl.ws_mutex);
-                if (!impl.ws_wait_head) {
-                    std::uint64_t best_sig = std::numeric_limits<std::uint64_t>::max();
-                    for (auto &candidate : impl.ws_slots) {
-                        if (!candidate.busy && candidate.signaled <= best_sig) {
-                            best_sig = candidate.signaled;
-                            slot = &candidate;
-                        }
-                    }
-                }
-                if (slot) {
-                    slot->busy = true;
-                } else {
-                    WaitNode node;
-                    if (impl.ws_wait_tail) {
-                        impl.ws_wait_tail->next = &node;
-                    } else {
-                        impl.ws_wait_head = &node;
-                    }
-                    impl.ws_wait_tail = &node;
-                    node.cv.wait(lock, [&] { return node.slot != nullptr; });
-                    slot = node.slot;
-                }
-                wait_val = slot->signaled;
-            }
-            if (!slot->buf) {
-                slot->buf = impl.buffer(impl.workspace_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, slot->info);
-            } else if (wait_val != 0) {
-                char error[1024]{};
-                if (impl.gpu->gpuExecWaitValue(impl.pool, wait_val, error, sizeof(error)) != gdDrained)
-                    throw std::runtime_error(std::string("GPU workspace wait: ") + error);
-            }
-            return slot->info;
-        }
-
-        void release(std::uint64_t new_val) {
-            if (!slot)
-                return;
-            std::lock_guard lock(impl.ws_mutex);
-            slot->signaled = new_val;
-            handoff_locked();
-        }
-    };
+    VkBuffer ensure_workspace() const {
+        if (workspace_size == 0)
+            return VK_NULL_HANDLE;
+        std::call_once(ws_once, [&] {
+            ws_buf = buffer(workspace_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, ws_info);
+        });
+        return ws_info.buffer;
+    }
 
     void process(const VSFrame *source, VSFrame *output) const {
         std::uint32_t source_stride = 0, output_stride = 0;
         auto input = plane(source, width, height, source_stride);
         auto destination = plane(output, width * 2, height * 2, output_stride);
-        SlotLease lease(*this);
-        const VSVulkanBufferInfo workspace_info = lease.acquire();
+        const VkBuffer workspace_buffer = ensure_workspace();
 
         char error[1024]{};
         Exec exec{gpu, gpu->gpuExecAcquire(pool, error, sizeof(error))};
@@ -1729,14 +2475,19 @@ struct Vulkan::Impl {
         gpu->gpuExecWritesPlane(exec.context, output, 0);
         const VkCommandBuffer cmd = gpu->gpuExecCommandBuffer(exec.context);
 
+        if (workspace_size > 0) {
+            barrier(cmd, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        }
+
         const auto w = static_cast<std::uint32_t>(width);
         const auto h = static_cast<std::uint32_t>(height);
 
         if (fast_path) {
             auto local = fast_slices;
             for (auto &slice : local)
-                slice.buffer = workspace_info.buffer;
+                slice.buffer = workspace_buffer;
             const FastPush push{w, h, w * h, source_stride, output_stride, w * 2, h * 2, 3u};
+            push_constants(cmd, push);
             VkPipeline bound = VK_NULL_HANDLE;
             for (std::size_t i = 0; i < fast_passes.size(); ++i) {
                 const FastPass &pass = fast_passes[i];
@@ -1749,22 +2500,27 @@ struct Vulkan::Impl {
                 const VkDescriptorBufferInfo ubo{parameter_info.buffer, pass.ubo_offset, pass.ubo_size};
                 const std::uint32_t gx = (w + pass.tile_w - 1) / pass.tile_w;
                 const std::uint32_t gy = (h + pass.tile_h - 1) / pass.tile_h;
-                dispatch_kernel(cmd, push, src, dst, ubo,
-                                VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, input,
-                                gx, gy, 1, i + 1 < fast_passes.size());
+                push_bindings(cmd, src, dst, ubo, input);
+                vk->vkCmdDispatch(cmd, gx, gy, 1);
+                if (i + 1 < fast_passes.size())
+                    barrier(cmd);
             }
         } else {
             auto local = fallback_slices;
             for (auto &slice : local)
-                slice.buffer = workspace_info.buffer;
+                slice.buffer = workspace_buffer;
             const VkDescriptorBufferInfo ssbo{parameter_info.buffer, 0, parameter_info.size};
             vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, fallback_pipeline);
-            const auto run_fb = [&](FallbackPush push, const VkDescriptorBufferInfo &src,
+            const auto run_fb = [&](const FallbackPush &push, const VkDescriptorBufferInfo &src,
                                     const VkDescriptorBufferInfo &dst, const VkDescriptorBufferInfo &aux,
                                     int ow, int oh, std::uint32_t groups, bool bar) {
-                dispatch_kernel(cmd, push, src, dst, ssbo, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, aux,
-                                (static_cast<std::uint32_t>(ow) + 7) / 8,
-                                (static_cast<std::uint32_t>(oh) + 7) / 8, groups, bar);
+                push_bindings(cmd, src, dst, ssbo, aux);
+                push_constants(cmd, push);
+                vk->vkCmdDispatch(cmd,
+                                  (static_cast<std::uint32_t>(ow) + 7) / 8,
+                                  (static_cast<std::uint32_t>(oh) + 7) / 8, groups);
+                if (bar)
+                    barrier(cmd);
             };
             VkDescriptorBufferInfo features = input;
             std::uint32_t feature_stride = source_stride;
@@ -1793,9 +2549,7 @@ struct Vulkan::Impl {
                        local[2], destination, local[4], width * 2, height * 2, 1, false);
             }
         }
-        std::uint64_t signaled = 0;
-        exec.submit(&signaled);
-        lease.release(signaled);
+        exec.submit();
     }
 };
 

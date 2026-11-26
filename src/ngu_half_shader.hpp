@@ -28,12 +28,27 @@ inline void replace_shader_text(std::string &s, const std::string &from, const s
         s.replace(pos, from.size(), to);
 }
 
-// Specialize the existing fusion generators, not a float32 network surrounded
-// by casts. All real types, literals, parameters, shared tiles and SSBOs become
-// native binary16. Integer indices remain 32-bit. Fused half parameters use
-// integer UBOs containing binary16 bits (with padding), not float32 values.
-// Fallback parameters and feature buffers retain native 16-bit SSBO storage.
+// Specialize the fusion and fallback generators into pure native binary16.
+// All real types, literals, parameters, shared tiles and SSBOs become binary16;
+// integer indices remain 32-bit. Fused half parameters pack eight binary16
+// coefficients densely into each 16-byte uvec4 (two f16vec4s in .xy and .zw,
+// zero wasted constant-cache bytes) and decode via OpBitcast without requiring
+// uniformAndStorageBuffer16BitAccess. Convolution MACs emit inline GLSL.std.450
+// binary16 Fma directly without function-call overhead.
 inline std::string half_shader(std::string s) {
+    const bool has_dense_ubo = s.find("NGU_UBO_DECL") != std::string::npos;
+    if (has_dense_ubo) {
+        replace_shader_text(s,
+            "#define NGU_UBO_DECL(n4, n8) layout(set=0, binding=2, std140) uniform Params { vec4 ubo[n4]; };",
+            "__NGU_HALF_UBO_DECL__");
+        replace_shader_text(s, "#define NGU_P0(i2) ubo[(i2) * 2u]", "__NGU_HALF_P0__");
+        replace_shader_text(s, "#define NGU_P1(i2) ubo[(i2) * 2u + 1u]", "__NGU_HALF_P1__");
+        replace_shader_text(s,
+            "#define NGU_LOAD_PAIR(i2, uvar, wa, wb) vec4 wa = ubo[(i2) * 2u], wb = ubo[(i2) * 2u + 1u]",
+            "__NGU_HALF_LOAD_PAIR__");
+        replace_shader_text(s, "#define NGU_MAC(acc, sv, wv) acc += (sv) * (wv)", "__NGU_HALF_MAC__");
+    }
+
     replace_shader_text(s, "#version 460", R"glsl(#version 460
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require)glsl");
@@ -44,8 +59,7 @@ inline std::string half_shader(std::string s) {
     replace_shader_text(s, "#define NGU_FROM_RAW uintBitsToFloat", "#define NGU_FROM_RAW(x) (x)");
     replace_shader_text(s, "#define NGU_TO_RAW floatBitsToUint", "#define NGU_TO_RAW(x) (x)");
 
-    // Exact binary16 roundings of the FP32 baseline constants. Do not evaluate
-    // uintBitsToFloat, unpackHalf2x16, or even untyped FP32 literals on the GPU.
+    // Exact binary16 roundings of the FP32 baseline constants.
     replace_shader_text(s, "uintBitsToFloat(0x3f5f3333u)", "0.8720703125");
     replace_shader_text(s, "uintBitsToFloat(0x3e766666u)", "0.2406005859375");
     replace_shader_text(s, "uintBitsToFloat(0xbdaccccdu)", "(-0.0843505859375)");
@@ -54,9 +68,7 @@ inline std::string half_shader(std::string s) {
     s = std::regex_replace(s, std::regex(R"(\bvec4\b)"), "f16vec4");
     s = std::regex_replace(s, std::regex(R"(\b([0-9]+\.[0-9]+)\b)"), "$1hf");
 
-    // Keep warp-uniform weights in the uniform cache without requiring
-    // uniformAndStorageBuffer16BitAccess. Each uvec4 holds four binary16
-    // coefficients in xy (zw is padding); OpBitcast decodes bits, not FP32.
+    // Legacy uniform Params block support if present without NGU_UBO_DECL.
     const auto params = s.find("layout(set=0, binding=2, std140) uniform Params");
     if (params != std::string::npos) {
         const auto end = s.find("};", params) + 2;
@@ -70,22 +82,31 @@ inline std::string half_shader(std::string s) {
                  "spirv_instruction(id=124) f16vec4 ngu_half_bits(uvec2 bits);\n");
     }
 
-    // Contract convolution MACs explicitly at binary16 precision. Only scalar
-    // feature * vector weight updates match this generator grammar; baseline
-    // filtering and output composition retain their separate roundings.
+    // Fallback shader scalar*vector MAC contraction to inline native binary16 FMA.
     s = std::regex_replace(s,
         std::regex(R"(\b(o[0-9]+|q[0-9]+_[0-9]+|p[0-9]+_[0-9]+|h[0-9]+|hsum|sum)\s*\+=\s*(\w+(?:\.[xyzw])?)\s*\*\s*([^;]+);)"),
-        "$1 = ngu_half_fma($2,$3,$1);");
+        "$1 = fma(f16vec4($2), $3, $1);");
 
     // No implicit contraction/reassociation outside the explicit half FMA.
-    // Constructors and function return types are not variable declarations.
-    // FP32 generators retain their original contraction policy.
     replace_shader_text(s, "precise ", "");
     s = std::regex_replace(s,
         std::regex(R"(\b(float16_t|f16vec4)(?=\s+\w+\s*(?:\[|=|;|,)))"), "precise $1");
-    s.insert(s.find("layout("),
-        "f16vec4 ngu_half_fma(float16_t v, f16vec4 w, f16vec4 acc) {\n"
-        "    return fma(f16vec4(v), w, acc);\n}\n");
+
+    if (has_dense_ubo) {
+        s.insert(s.find("layout("),
+                 "spirv_instruction(id=124) f16vec4 ngu_half_bits(uvec2 bits);\n");
+        replace_shader_text(s, "__NGU_HALF_UBO_DECL__",
+            "#define NGU_UBO_DECL(n4, n8) layout(set=0, binding=2, std140) uniform Params { uvec4 ubo[n8]; };");
+        replace_shader_text(s, "__NGU_HALF_P0__",
+            "#define NGU_P0(i2) ngu_half_bits(ubo[i2].xy)");
+        replace_shader_text(s, "__NGU_HALF_P1__",
+            "#define NGU_P1(i2) ngu_half_bits(ubo[i2].zw)");
+        replace_shader_text(s, "__NGU_HALF_LOAD_PAIR__",
+            "#define NGU_LOAD_PAIR(i2, uvar, wa, wb) uvec4 uvar = ubo[i2]; "
+            "precise f16vec4 wa = ngu_half_bits(uvar.xy), wb = ngu_half_bits(uvar.zw)");
+        replace_shader_text(s, "__NGU_HALF_MAC__",
+            "#define NGU_MAC(acc, sv, wv) acc = fma(f16vec4(sv), wv, acc)");
+    }
     return s;
 }
 
