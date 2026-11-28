@@ -46,7 +46,7 @@ inline std::string half_shader(std::string s) {
         replace_shader_text(s,
             "#define NGU_LOAD_PAIR(i2, uvar, wa, wb) vec4 wa = ubo[(i2) * 2u], wb = ubo[(i2) * 2u + 1u]",
             "__NGU_HALF_LOAD_PAIR__");
-        replace_shader_text(s, "#define NGU_MAC(acc, sv, wv) acc += (sv) * (wv)", "__NGU_HALF_MAC__");
+        replace_shader_text(s, "#define NGU_MAC(acc, sv, wv) acc = fma(vec4(sv), wv, acc)", "__NGU_HALF_MAC__");
     }
 
     replace_shader_text(s, "#version 460", R"glsl(#version 460
@@ -56,8 +56,13 @@ inline std::string half_shader(std::string s) {
     replace_shader_text(s, "4462, 32", "4462, 16");
     s.insert(s.find("layout("), "spirv_execution_mode(capabilities=[4464], 4459, 16);\n");
     replace_shader_text(s, "#define NGU_RAW uint", "#define NGU_RAW float16_t");
+    replace_shader_text(s, "#define NGU_RAW2 uvec2", "#define NGU_RAW2 f16vec2");
     replace_shader_text(s, "#define NGU_FROM_RAW uintBitsToFloat", "#define NGU_FROM_RAW(x) (x)");
     replace_shader_text(s, "#define NGU_TO_RAW floatBitsToUint", "#define NGU_TO_RAW(x) (x)");
+    replace_shader_text(s, "#define NGU_PACK_RAW2(a, b) uvec2((a), floatBitsToUint(b))",
+                        "#define NGU_PACK_RAW2(a, b) f16vec2((a), (b))");
+    replace_shader_text(s, "#define NGU_PACK_F2(a, b) uvec2(floatBitsToUint(a), floatBitsToUint(b))",
+                        "#define NGU_PACK_F2(a, b) f16vec2((a), (b))");
 
     // Exact binary16 roundings of the FP32 baseline constants.
     replace_shader_text(s, "uintBitsToFloat(0x3f5f3333u)", "0.8720703125");
@@ -65,6 +70,7 @@ inline std::string half_shader(std::string s) {
     replace_shader_text(s, "uintBitsToFloat(0xbdaccccdu)", "(-0.0843505859375)");
     replace_shader_text(s, "uintBitsToFloat(0xbce66666u)", "(-0.0281219482421875)");
     s = std::regex_replace(s, std::regex(R"(\bfloat\b)"), "float16_t");
+    s = std::regex_replace(s, std::regex(R"(\bvec2\b)"), "f16vec2");
     s = std::regex_replace(s, std::regex(R"(\bvec4\b)"), "f16vec4");
     s = std::regex_replace(s, std::regex(R"(\b([0-9]+\.[0-9]+)\b)"), "$1hf");
 
@@ -90,7 +96,7 @@ inline std::string half_shader(std::string s) {
     // No implicit contraction/reassociation outside the explicit half FMA.
     replace_shader_text(s, "precise ", "");
     s = std::regex_replace(s,
-        std::regex(R"(\b(float16_t|f16vec4)(?=\s+\w+\s*(?:\[|=|;|,)))"), "precise $1");
+        std::regex(R"(\b(float16_t|f16vec2|f16vec4)(?=\s+\w+\s*(?:\[|=|;|,)))"), "precise $1");
 
     if (has_dense_ubo) {
         s.insert(s.find("layout("),
