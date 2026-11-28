@@ -26,10 +26,12 @@ Load **one** NGU file at a time. The exporter doesn't change mpv settings.
 
 Shaders fuse multiple layers and final head/combine into **1–5 LUMA-only
 compute passes** (`low`: 1 pass with zero intermediate textures, `medium`:
-2 passes, `high`: 4 passes, `very_high`: 5 passes) using planar shared-memory
-tiles within the portable 32-KiB shared-memory limit. Intermediate feature
-maps pack 8 channels into `2×1`, 12 channels into `3×1`, and 16 channels into
-`2×2` RGBA texels per source pixel. Normalized luma is read with `LUMA_mul`;
+2 passes with 1 intermediate texture, `high`: 4 passes reusing 2 ping-pong
+textures, `very_high`: 5 passes reusing 2 ping-pong textures) using warp-stripe
+planar shared-memory tiles within the portable 32-KiB shared-memory limit.
+Intermediate feature maps pack 8 channels into `2×1`, 12 channels into `3×1`,
+and 16 channels into `2×2` contiguous planar RGBA sub-planes for coalesced
+warp reads and writes. Normalized luma is read with `LUMA_mul`;
 mpv still handles chroma sampling and color conversion. Every pass runs only
 when the target width **or** height exceeds the original luma dimension by more
 than two pixels. AA keeps the raw corner-aligned NGU grid and uses

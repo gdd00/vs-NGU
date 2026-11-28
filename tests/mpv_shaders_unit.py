@@ -76,6 +76,9 @@ class ExportTests(unittest.TestCase):
                 self.assertEqual(glsl.count("//!COMPUTE "), expected_passes)
                 self.assertEqual("#define NGU_NATIVE_FP16 1" in glsl, native_fp16)
                 self.assertEqual("//!OFFSET -0.5 -0.5" in glsl, aa)
+                saves = {line.split(None, 1)[1] for line in glsl.splitlines()
+                         if line.startswith("//!SAVE ")}
+                self.assertLessEqual(len(saves), 2)
 
 
 if __name__ == "__main__":
